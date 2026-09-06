@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "langgraph>=1.2.11",
     "ollama>=0.6.2",
     "pydantic>=2.13.5",
 ]
