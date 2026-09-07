@@ -3,9 +3,8 @@
 > Single source of truth for this project: what it is, why it exists, what has been built in each
 > phase, and the reasoning behind every significant decision.
 >
-> **Last updated:** 2026-09-07 · **Current phase:** Phase 5 — investigation agent runs end-to-end
-> against a local model across two scenarios. Coverage enforcement added; live re-verification in
-> progress. Still outstanding: wiring the agent into the incident workflow.
+> **Last updated:** 2026-09-07 · **Current phase:** Phase 5 complete — the full pipeline (assess →
+> investigate → route) runs end-to-end against a local model on two scenarios. Phase 6 (RAG) next.
 
 ---
 
@@ -116,8 +115,8 @@ src/agentic_ai/
 ├── domain/       Business entities and their invariants (Incident, Severity, lifecycle rules)
 ├── llm/          Stateless LLM capabilities (one call in, structured output out)
 ├── tools/        The agent's perceptual world — what it can observe
+├── agents/       Autonomous reasoning: the bounded investigation loop
 ├── workflows/    LangGraph orchestration: state, nodes, edges, routing
-├── agents/       (empty) Autonomous reasoning/tool-using agents — Phase 5+
 └── api/          (empty) HTTP layer — later phase
 ```
 
@@ -127,9 +126,11 @@ src/agentic_ai/
   what to do next. An **agent** has a loop, state it reasons over, and chooses its own next action.
   A capability is something an agent *uses*.
 - `workflows/` vs `agents/` — `workflows/` owns graph wiring and deterministic orchestration;
-  `agents/` will own autonomous decision-making. ⚠️ **This boundary is provisional.** In Phase 7 a
-  Supervisor agent will itself likely be a LangGraph graph, which will force this line to be redrawn.
-  Noted now so it isn't discovered by surprise.
+  `agents/` owns autonomous decision-making. The boundary held up when the two were connected: the
+  workflow's `investigate_node` *calls* `investigate()` rather than embedding the agent's graph, so
+  each side keeps its own state shape and neither leaks into the other. ⚠️ **Still provisional** — in
+  Phase 7 a Supervisor agent will itself likely be a LangGraph graph, which may force this line to be
+  redrawn.
 - `domain/` stays free of LLM and framework imports — business rules must be testable without a
   model or a graph.
 
@@ -681,11 +682,62 @@ drops to `0.8` for the causal claim *"connection pool exhaustion is the root cau
 separating observation from inference in its own output, mirroring the Evidence/Finding split the
 domain model encodes.
 
+#### 5e. Wiring the agent into the workflow ✅
+
+**Built:** `investigate_node` in `workflows/incident.py` now calls the real agent, and the flow was
+reordered.
+
+```
+START → assess_severity → investigate ─┬─ urgent → escalate → END
+                                       └─ normal → monitor  → END
+```
+
+**Key decisions:**
+
+- **Every incident is investigated before routing.** The previous order routed severity straight to
+  `escalate`, which meant the *most serious* incidents were the ones nobody investigated — an
+  escalation arriving with no evidence attached. Investigation now precedes routing, so escalation
+  always carries findings, and the router can see them.
+- **A failed or incomplete investigation escalates regardless of severity.**
+
+  ```python
+  if investigation is None or not investigation.is_complete:
+      return "urgent"
+  ```
+
+  An incident nobody could explain is precisely the one a human should look at, even if it first
+  appeared minor. This is the first place `is_complete` does real work: `MAX_STEPS_REACHED` now
+  changes what the system *does*, not merely what it reports — which is why keeping
+  `termination_reason` separate from confidence mattered.
+- **Investigation failure does not sink the workflow, but real bugs still surface.**
+  `investigate_node` catches `InvestigationError` and records it so routing can continue; a
+  `RuntimeError` (Ollama unreachable, say) propagates untouched. Same failure-category discipline as
+  Phase 3, with a test asserting the unexpected error is *not* swallowed.
+- **Routing stays deterministic.** The model assessed severity and produced findings; whether that
+  warrants paging a human is policy, expressed as `ESCALATION_SEVERITIES` in plain Python.
+
+**Live end-to-end result — both scenarios correct:**
+
+| | Pool exhaustion | Upstream failure |
+|---|---|---|
+| Severity | `high` | `high` |
+| Tools called | all three | all three |
+| Termination | `completed` | `completed` |
+| Root cause | connection pool exhausted | `card-authorization-api` 503s |
+| Routed to | `escalate` | `escalate` |
+| Recommended action | increase pool size | investigate the upstream API |
+
+An unplanned improvement appeared: the model began **citing its sources inline** —
+*"The error rate is 12.5% (get_mock_metrics) … the logs indicate repeated errors (get_mock_logs)"* —
+attributing each claim to the tool that produced it. That emerged from the *"only state facts you
+actually observed"* rule, and it is exactly the traceability the `Evidence` model exists to provide.
+
 ---
 
 ## 5. Current State
 
-**Test suite: 46 passing** (11 incident · 4 severity · 3 workflow · 14 mock tools · 14 investigation)
+**Test suite: 67 passing** (11 incident · 4 severity · 8 workflow · 16 mock tools · 16 investigation ·
+12 investigation domain/registry)
 
 ```
 src/agentic_ai/
@@ -697,8 +749,8 @@ src/agentic_ai/
 ├── tools/
 │   ├── mock_tools.py        get_mock_logs/metrics/pod_status(), MockService
 │   └── registry.py          build_tool_schemas(), dispatch_tool(), ToolNotFoundError
-├── agents/investigation.py  bounded ReAct subgraph, investigate(), MAX_INVESTIGATION_STEPS
-├── workflows/incident.py    IncidentWorkflowState, nodes, conditional routing
+├── agents/investigation.py  bounded ReAct subgraph, investigate(), coverage enforcement
+├── workflows/incident.py    assess -> investigate -> route, handle_incident()
 └── api/                     (empty — later)
 ```
 
@@ -721,8 +773,8 @@ main
 | `Finding.supporting_evidence_ids` | Deferred, recorded | Needed for RCA, audit, explainability |
 | `TIMEOUT` termination reason | Reserved, unreachable | No wall-clock enforcement implemented yet |
 | `TimelineEntry.event_type` | Not built | Must be an **enum**, not free text |
-| `workflows/` vs `agents/` boundary | Provisional | Will be forced open in Phase 7 by the Supervisor |
-| Investigation not wired into workflow | Open | `investigate_node` in `workflows/incident.py` is still a placeholder; the agent runs standalone |
+| `workflows/` vs `agents/` boundary | Provisional | Held up so far: the workflow node *calls* the agent rather than embedding it. Will be tested again in Phase 7 by the Supervisor |
+| `escalate` / `monitor` are stubs | Open | They set `next_step` but take no action. Real behaviour arrives with Phase 10 approval gates and Phase 11 remediation |
 | `AVAILABLE_SERVICES` mutability | Minor | `list` → `tuple` would prevent accidental mutation |
 | Linter / formatter | Not set up | `ruff` or `black`; stray-whitespace artifacts already seen |
 | Git author identity | Unconfigured | Commits carry an auto-guessed name/email on a public repo |
