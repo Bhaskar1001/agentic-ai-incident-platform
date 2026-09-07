@@ -9,6 +9,8 @@ from typing import Any
 
 from agentic_ai.tools.mock_tools import (
     AVAILABLE_SERVICES,
+    DEFAULT_SCENARIO,
+    Scenario,
     get_mock_logs,
     get_mock_metrics,
     get_mock_pod_status,
@@ -69,8 +71,16 @@ def build_tool_schemas() -> list[dict[str, Any]]:
     ]
 
 
-def dispatch_tool(name: str, arguments: dict[str, Any]) -> str:
+def dispatch_tool(
+    name: str,
+    arguments: dict[str, Any],
+    scenario: Scenario | str = DEFAULT_SCENARIO,
+) -> str:
     """Call a registered tool by name.
+
+    ``scenario`` selects which mock fixture set the tools draw from. It is
+    supplied by the caller, never by the model - the schema above advertises
+    only ``service``, so the agent cannot choose its own reality.
 
     Raises:
         ToolNotFoundError: if the model hallucinated a tool that does not
@@ -80,4 +90,10 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> str:
     if name not in INVESTIGATION_TOOLS:
         raise ToolNotFoundError(name)
 
-    return INVESTIGATION_TOOLS[name](**arguments)
+    # Ignore any 'scenario' the model may have invented; it is not ours to
+    # take from the model's arguments.
+    safe_arguments = {
+        key: value for key, value in arguments.items() if key != "scenario"
+    }
+
+    return INVESTIGATION_TOOLS[name](**safe_arguments, scenario=scenario)

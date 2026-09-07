@@ -23,6 +23,7 @@ from agentic_ai.domain.investigation import (
     TimelineEntry,
     TimelineEventType,
 )
+from agentic_ai.tools.mock_tools import DEFAULT_SCENARIO, Scenario
 from agentic_ai.tools.registry import (
     INVESTIGATION_TOOLS,
     ToolNotFoundError,
@@ -32,8 +33,23 @@ from agentic_ai.tools.registry import (
 
 MODEL = "llama3.2"
 
-MAX_INVESTIGATION_STEPS = 5
-"""One step = reason -> select tool -> execute -> observe."""
+MAX_INVESTIGATION_STEPS = 8
+"""One step = reason -> select tool -> execute -> observe.
+
+Sized to leave headroom above MIN_DISTINCT_TOOLS. A model that tries to
+conclude after every single call needs 3 tool calls plus 2 rejections just to
+satisfy coverage; a budget of 5 would leave no room for a failed call or a
+hallucinated tool name.
+"""
+
+MIN_DISTINCT_TOOLS = 3
+"""Evidence coverage required before the agent may conclude.
+
+The model has repeatedly judged one source sufficient and then reported high
+confidence on partial evidence - including asserting metric values it never
+retrieved. Sufficiency of evidence is a boundary, so deterministic code owns
+it rather than the model's discretion.
+"""
 
 
 class InvestigationError(Exception):
@@ -53,6 +69,7 @@ class InvestigationState(TypedDict):
     """State threaded through the investigation subgraph."""
 
     incident_description: str
+    scenario: str
     messages: Annotated[list[dict[str, Any]], _append]
     evidence: Annotated[list[Evidence], _append]
     timeline: Annotated[list[TimelineEntry], _append]
@@ -62,23 +79,30 @@ class InvestigationState(TypedDict):
 
 _SYSTEM_PROMPT = (
     "You are an incident investigation agent for a production system.\n\n"
-    "Your job is to find the ROOT CAUSE, not just the symptom. A single "
-    "source of data is never enough to establish a root cause: logs show "
-    "symptoms, metrics show magnitude, and pod status shows whether the "
-    "service itself is healthy. Corroborate across sources.\n\n"
-    "Investigation procedure:\n"
-    "1. Call get_mock_logs to see what errors are occurring.\n"
-    "2. Call get_mock_metrics to quantify the problem.\n"
-    "3. Call get_mock_pod_status to check instance health.\n"
-    "4. Only then, explain what the combined evidence shows.\n\n"
+    "Your job is to find the ROOT CAUSE, not just restate the symptom. A "
+    "single source of data is never enough: logs show what errors occurred, "
+    "metrics show their magnitude and the health of anything this service "
+    "depends on, and pod status shows whether the service's own instances "
+    "are healthy. Corroborate across all of them before concluding.\n\n"
+    "Be careful to distinguish a fault in this service from a fault "
+    "somewhere else that this service is merely reporting. Evidence that the "
+    "service's own resources are healthy is meaningful, not a dead end.\n\n"
+    "You MUST gather evidence from all three of these tools before drawing "
+    "any conclusion:\n"
+    "- get_mock_logs\n"
+    "- get_mock_metrics\n"
+    "- get_mock_pod_status\n\n"
+    "You may call them in whatever order the evidence suggests, but you must "
+    "call all three.\n\n"
     "Rules:\n"
     "- Call ONE tool per turn.\n"
-    "- Do NOT stop after a single tool call. Gather evidence from all three "
-    "sources before concluding.\n"
+    "- Do NOT conclude until all three tools have been called.\n"
     "- Do NOT repeat a tool call you have already made.\n"
     "- You have at most {max_steps} tool calls in total.\n"
-    "- When you have gathered evidence from all sources, reply in plain text "
-    "explaining the root cause and the specific evidence supporting it."
+    "- Only state facts you actually observed in a tool result. Do not claim "
+    "a metric value or a log message you have not seen.\n"
+    "- Once all three tools have been called, reply in plain text explaining "
+    "the root cause and the specific observations supporting it."
 )
 
 
@@ -148,7 +172,7 @@ def execute_tools_node(state: InvestigationState) -> dict[str, Any]:
         )
 
         try:
-            raw_output = dispatch_tool(name, arguments)
+            raw_output = dispatch_tool(name, arguments, scenario=state["scenario"])
         except ToolNotFoundError:
             raw_output = json.dumps(
                 {
@@ -208,18 +232,65 @@ def execute_tools_node(state: InvestigationState) -> dict[str, Any]:
     }
 
 
+def _distinct_tools_used(state: InvestigationState) -> set[str]:
+    """Tool names that actually returned evidence (failed calls don't count)."""
+    return {item.source_tool for item in state["evidence"]}
+
+
 def should_continue(state: InvestigationState) -> str:
     """Decide whether to keep investigating.
 
-    The model's judgement is honoured only within the deterministic budget.
+    The model's judgement is honoured only within deterministic bounds: it may
+    not conclude before minimum evidence coverage is met, and it may not
+    continue past the step budget.
     """
-    if state["termination_reason"] is not None:
-        return "stop"
-
     if state["steps_taken"] >= MAX_INVESTIGATION_STEPS:
         return "budget_exhausted"
 
+    if state["termination_reason"] is not None:
+        if len(_distinct_tools_used(state)) >= MIN_DISTINCT_TOOLS:
+            return "stop"
+        return "insufficient_evidence"
+
     return "continue"
+
+
+def require_more_evidence_node(state: InvestigationState) -> dict[str, Any]:
+    """Reject a premature conclusion and send the agent back for more evidence.
+
+    Clears ``termination_reason`` so the cycle resumes, and tells the model
+    specifically which tools it has not yet used.
+    """
+    remaining = sorted(set(INVESTIGATION_TOOLS) - _distinct_tools_used(state))
+
+    return {
+        "termination_reason": None,
+        # A rejection consumes budget. Without this, a model that repeatedly
+        # claims to be done would cycle here forever: steps_taken is only
+        # advanced by tool execution, so nothing would ever bound the loop.
+        "steps_taken": state["steps_taken"] + 1,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "You have not gathered enough evidence to conclude. You "
+                    f"have not yet called: {', '.join(remaining)}. Call the "
+                    "next one now."
+                ),
+            }
+        ],
+        "timeline": [
+            TimelineEntry(
+                event_type=TimelineEventType.INSUFFICIENT_EVIDENCE,
+                description=(
+                    "Agent tried to conclude with "
+                    f"{len(_distinct_tools_used(state))} of "
+                    f"{MIN_DISTINCT_TOOLS} required sources."
+                ),
+                metadata={"remaining_tools": remaining},
+            )
+        ],
+    }
 
 
 def budget_exhausted_node(state: InvestigationState) -> dict[str, Any]:
@@ -244,6 +315,7 @@ def build_investigation_graph():
 
     builder.add_node("reason", reason_node)
     builder.add_node("execute_tools", execute_tools_node)
+    builder.add_node("require_more_evidence", require_more_evidence_node)
     builder.add_node("budget_exhausted", budget_exhausted_node)
 
     builder.add_edge(START, "reason")
@@ -254,12 +326,16 @@ def build_investigation_graph():
         path_map={
             "continue": "execute_tools",
             "stop": END,
+            "insufficient_evidence": "require_more_evidence",
             "budget_exhausted": "budget_exhausted",
         },
     )
 
     # The cycle: observations feed back into reasoning.
     builder.add_edge("execute_tools", "reason")
+    # A rejected conclusion also re-enters the cycle. The step budget still
+    # bounds this, so it cannot loop forever.
+    builder.add_edge("require_more_evidence", "reason")
     builder.add_edge("budget_exhausted", END)
 
     return builder.compile()
@@ -268,10 +344,18 @@ def build_investigation_graph():
 investigation_graph = build_investigation_graph()
 
 
-def investigate(incident_description: str) -> InvestigationResult:
-    """Run a bounded investigation and return a structured result."""
+def investigate(
+    incident_description: str,
+    scenario: Scenario | str = DEFAULT_SCENARIO,
+) -> InvestigationResult:
+    """Run a bounded investigation and return a structured result.
+
+    ``scenario`` selects which mock fixture set the tools draw from. It exists
+    only because the tools are mocks; a real deployment would have one reality.
+    """
     initial_state: InvestigationState = {
         "incident_description": incident_description,
+        "scenario": Scenario(scenario).value,
         "messages": [
             {
                 "role": "system",
@@ -327,7 +411,18 @@ def _summarise(state: InvestigationState) -> InvestigationResult:
         ("evidence", "timeline", "termination_reason")
     ]
 
-    messages = state["messages"] + [{"role": "user", "content": _SUMMARY_INSTRUCTION}]
+    instruction = _SUMMARY_INSTRUCTION
+    used = _distinct_tools_used(state)
+    if len(used) < MIN_DISTINCT_TOOLS:
+        missing = sorted(set(INVESTIGATION_TOOLS) - used)
+        instruction += (
+            "\n\nIMPORTANT: this investigation is INCOMPLETE. You never "
+            f"retrieved data from: {', '.join(missing)}. Do not state facts "
+            "from those sources. Keep model_assessed_confidence at or below "
+            "0.5, and list what you could not check in unresolved_questions."
+        )
+
+    messages = state["messages"] + [{"role": "user", "content": instruction}]
 
     last_error: Exception | None = None
     for _ in range(2):

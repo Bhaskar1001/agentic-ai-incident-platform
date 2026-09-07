@@ -3,8 +3,9 @@
 > Single source of truth for this project: what it is, why it exists, what has been built in each
 > phase, and the reasoning behind every significant decision.
 >
-> **Last updated:** 2026-09-07 · **Current phase:** Phase 5 complete — investigation agent working
-> end-to-end against a local model. Phase 6 (RAG) next.
+> **Last updated:** 2026-09-07 · **Current phase:** Phase 5 — investigation agent runs end-to-end
+> against a local model across two scenarios. Coverage enforcement added; live re-verification in
+> progress. Still outstanding: wiring the agent into the incident workflow.
 
 ---
 
@@ -599,6 +600,87 @@ Assessment: the **summary instruction was probably the bigger lever** — the or
 no idea what a good summary or finding looks like, which is why it produced filler text and an empty
 findings list.
 
+#### 5d. Second scenario, and enforcing evidence coverage ✅
+
+**Goal:** find out whether the agent *reasons* or merely *pattern-matches*. One validated scenario
+proves nothing — the prompt at that point literally listed the three tools in order, so the model may
+simply have been following a script toward a memorised answer.
+
+**Built:** a second scenario — **upstream dependency failure** — where the payment service is
+*healthy* and a downstream API (`card-authorization-api`) is returning 503s with 10-second timeouts.
+A second, *healthy* dependency (`ledger-api`) sits alongside it, so the agent must isolate which one.
+
+| Signal | Pool exhaustion | Upstream failure |
+|---|---|---|
+| DB connections | 100/100 (**saturated**) | 12/100 (**healthy**) |
+| Pods | 2 unready, 4–5 restarts | **all ready, 0 restarts** |
+| Latency p50 | 850 ms (degraded) | **60 ms (fine)** |
+| Latency p95 | 2 400 ms | 10 200 ms (**upstream timeout**) |
+| Logs | "connection pool exhausted" | "503 from card-authorization-api" |
+
+An agent that pattern-matches the first scenario will reach for pool exhaustion. The evidence here
+actively contradicts that.
+
+**Fixture design decision — an explicit `scenario` parameter, not module-level state.** A
+`set_scenario()` switch would have been more convenient, but it makes the tools return different data
+depending on invisible state: no longer pure functions of their arguments, and tests must remember to
+reset between runs. An explicit parameter with a default keeps determinism intact.
+
+Critically, **the model never sees it.** `build_tool_schemas()` advertises only `service`, and
+`dispatch_tool()` strips any `scenario` key the model might invent before injecting the caller's
+value. The agent cannot choose its own reality — the same structural-not-instructional principle as
+stripping `evidence` from the summary schema.
+
+**Result — the agent does not pattern-match.** On the upstream scenario it correctly identified the
+fault as external and named the right dependency, with this line in its findings:
+
+> *"The local database query completed normally, suggesting that the issue is not with the database."*
+
+It actively ruled out the *other* scenario's root cause rather than defaulting to it.
+
+**But it called only one tool** — logs — and concluded from that alone, reporting findings at
+confidence `1.0`, `1.0`, `1.0`, including a summary claim that *"the upstream service has a high
+error rate"*, a fact that lives in the metrics it never retrieved. **Right answer, incomplete
+evidence, false confidence** — a worse failure mode than being wrong loudly, because nothing
+distinguishes it from the case where the guess is wrong.
+
+**The regression run changed the diagnosis.** Scenario 1, run with the *same* generalised prompt,
+called all three tools — and in a different order than the old numbered list. So this was never "the
+prompt broke compliance":
+
+> **Compliance is non-deterministic.** Same prompt, same model, different scenario, different
+> behaviour. You cannot instruct your way out of non-determinism; you can only bound it in code.
+
+**Fix — prompt *and* deterministic enforcement:**
+
+1. **Prompt re-enumerates the three tool names**, but explicitly does *not* prescribe an order
+   (*"call them in whatever order the evidence suggests, but you must call all three"*), so it does
+   not re-overfit to a sequence. Added a rule: *"Only state facts you actually observed in a tool
+   result."*
+2. **`MIN_DISTINCT_TOOLS = 3`, enforced in the graph.** A premature conclusion routes to a new
+   `require_more_evidence` node, which clears the termination, names the specific tools not yet
+   called, and re-enters the cycle. **The model's "I'm done" became a request, not a decision** —
+   sufficiency of evidence is a boundary, and boundaries belong to code.
+3. **Confidence capping.** If an investigation ends with partial coverage, the summariser is told
+   which sources are missing, instructed not to state facts from them, and capped at ≤ 0.5.
+
+**A bug introduced by the fix, and worth recording.** The first version produced a
+`GraphRecursionError`: `require_more_evidence` cleared `termination_reason` and looped back to
+`reason`, but `steps_taken` only advanced inside `execute_tools_node` — so a model that kept claiming
+to be done without calling tools cycled forever. **A guard against unbounded model behaviour that was
+itself unbounded.** Fixed by charging a rejection one step, which then forced
+`MAX_INVESTIGATION_STEPS` from 5 to 8: a stubborn model needs 3 calls + 2 rejections = exactly 5,
+leaving no headroom for a failed or hallucinated call. The arithmetic is documented in the constant.
+
+**Live verification — both scenarios now call all three tools**, in *different* orders
+(`logs→pods→metrics` and `pods→metrics→logs`), confirming exploration rather than script-following.
+Both reach correct, evidence-grounded diagnoses and every cited number is real.
+
+The confidence values became honest too. Scenario 1 assigns `1.0` to four directly-observed facts and
+drops to `0.8` for the causal claim *"connection pool exhaustion is the root cause"* — the model
+separating observation from inference in its own output, mirroring the Evidence/Finding split the
+domain model encodes.
+
 ---
 
 ## 5. Current State
@@ -645,7 +727,7 @@ main
 | Linter / formatter | Not set up | `ruff` or `black`; stray-whitespace artifacts already seen |
 | Git author identity | Unconfigured | Commits carry an auto-guessed name/email on a public repo |
 | Model-assessed confidence calibration | Unknown | Ordering looks sensible; true calibration is a Phase 13 question |
-| Prompt robustness | Unproven | Quality verified on **one** scenario. A second fixture set is needed to know whether the prompt generalises or is overfitted to pool exhaustion |
+| Prompt robustness | Improved | Verified on two scenarios; a third (e.g. "nothing is wrong") would test whether it can decline to find a problem |
 
 ---
 
@@ -710,3 +792,8 @@ Extracted from decisions actually made in this project, not aspirational:
     a prompting problem or a capability ceiling.
 14. **Make invariants structural, not instructional.** Stripping `evidence` from the schema means the
     model *cannot* author it. Asking it politely not to would have been a hope, not a guarantee.
+15. **You cannot instruct your way out of non-determinism.** The same prompt produced full tool
+    coverage on one scenario and a single call on another. Prompts shift probabilities; only code
+    provides guarantees.
+16. **Test a second case before believing the first.** One passing scenario cannot distinguish
+    reasoning from pattern-matching, and a prompt tuned on one example is a prompt overfitted to it.

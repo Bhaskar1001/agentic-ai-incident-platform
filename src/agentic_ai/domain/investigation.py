@@ -41,6 +41,7 @@ class TimelineEventType(str, Enum):
     TOOL_SELECTED = "tool_selected"
     TOOL_SUCCEEDED = "tool_succeeded"
     TOOL_FAILED = "tool_failed"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
     INVESTIGATION_CONCLUDED = "investigation_concluded"
     STEP_LIMIT_REACHED = "step_limit_reached"
 
