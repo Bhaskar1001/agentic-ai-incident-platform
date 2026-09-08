@@ -153,3 +153,56 @@ def test_scenarios_are_distinguishable() -> None:
     """The two scenarios must not produce identical evidence."""
     for tool in ALL_TOOLS:
         assert tool("payment", POOL) != tool("payment", UPSTREAM)
+
+
+# --- scenario 3: nothing is wrong ----------------------------------------
+#
+# The hardest case. Both other scenarios contain a real fault, so the agent
+# has never had the option of being wrong by *inventing* one. These fixtures
+# deliberately include benign noise - a successful retry, one old restart -
+# so that concluding "healthy" requires judgement rather than seeing an
+# empty page.
+
+HEALTHY = Scenario.HEALTHY
+
+
+def test_healthy_logs_contain_no_errors() -> None:
+    parsed = json.loads(get_mock_logs("payment", HEALTHY))
+
+    assert not [e for e in parsed["logs"] if e["level"] == "ERROR"]
+
+
+def test_healthy_logs_still_contain_benign_noise() -> None:
+    """A silent service would be an unrealistically easy test."""
+    levels = {entry["level"] for entry in json.loads(get_mock_logs("payment", HEALTHY))["logs"]}
+
+    assert "WARN" in levels
+
+
+def test_healthy_metrics_are_all_nominal() -> None:
+    metrics = json.loads(get_mock_metrics("payment", HEALTHY))["metrics"]
+
+    connections = metrics["database_connections"]
+    assert connections["utilization_percent"] < 30
+    assert metrics["error_rate_percent"] < 1
+    assert metrics["latency_ms"]["p95"] < 500
+    assert metrics["cpu_percent"] < 50
+    assert metrics["memory_percent"] < 50
+
+
+def test_healthy_dependencies_are_all_closed() -> None:
+    dependencies = json.loads(get_mock_metrics("payment", HEALTHY))["metrics"][
+        "upstream_dependencies"
+    ]
+
+    assert all(dep["circuit_breaker"] == "closed" for dep in dependencies.values())
+    assert all(dep["error_rate_percent"] < 1 for dep in dependencies.values())
+
+
+def test_healthy_pods_are_all_ready() -> None:
+    pods = json.loads(get_mock_pod_status("payment", HEALTHY))["pods"]
+
+    assert all(pod["ready"] for pod in pods)
+    # One old restart from a routine deploy - benign, but a pattern-matching
+    # agent may seize on it.
+    assert sum(pod["restart_count"] for pod in pods) == 1

@@ -34,6 +34,9 @@ class Scenario(str, Enum):
     UPSTREAM_DEPENDENCY_FAILURE = "upstream_dependency_failure"
     """The service is healthy; a downstream API it depends on is failing."""
 
+    HEALTHY = "healthy"
+    """Nothing is wrong. The correct conclusion is that there is no incident."""
+
 
 DEFAULT_SCENARIO = Scenario.CONNECTION_POOL_EXHAUSTION
 
@@ -116,6 +119,37 @@ _LOGS: dict[Scenario, dict[str, Any]] = {
             },
         ],
     },
+    # A healthy service is not silent. Real systems always carry some benign
+    # noise: a retry that succeeded, a slow-but-fine query, a routine warning.
+    # A fixture with zero anomalies would be an unrealistically easy test -
+    # the point is whether the agent can see minor noise and still conclude
+    # that nothing is wrong.
+    Scenario.HEALTHY: {
+        "status": "success",
+        "service": "payment",
+        "logs": [
+            {
+                "level": "INFO",
+                "message": "Payment processed successfully",
+                "transaction_count": 1432,
+            },
+            {
+                "level": "WARN",
+                "message": "Retry succeeded on second attempt",
+                "upstream": "card-authorization-api",
+                "attempts": 2,
+            },
+            {
+                "level": "INFO",
+                "message": "Scheduled cache refresh completed",
+                "duration_ms": 240,
+            },
+            {
+                "level": "INFO",
+                "message": "Health check passed",
+            },
+        ],
+    },
 }
 
 _METRICS: dict[Scenario, dict[str, Any]] = {
@@ -152,6 +186,34 @@ _METRICS: dict[Scenario, dict[str, Any]] = {
                     "error_rate_percent": 97.0,
                     "latency_ms": {"p50": 10000, "p95": 10400},
                     "circuit_breaker": "open",
+                },
+                "ledger-api": {
+                    "error_rate_percent": 0.1,
+                    "latency_ms": {"p50": 35, "p95": 80},
+                    "circuit_breaker": "closed",
+                },
+            },
+        },
+    },
+    Scenario.HEALTHY: {
+        "status": "success",
+        "service": "payment",
+        "metrics": {
+            "database_connections": {
+                "active": 18,
+                "pool_size": 100,
+                "utilization_percent": 18,
+            },
+            "error_rate_percent": 0.2,
+            "latency_ms": {"p50": 45, "p95": 120, "p99": 310},
+            "requests_per_second": 132,
+            "cpu_percent": 27,
+            "memory_percent": 44,
+            "upstream_dependencies": {
+                "card-authorization-api": {
+                    "error_rate_percent": 0.3,
+                    "latency_ms": {"p50": 90, "p95": 210},
+                    "circuit_breaker": "closed",
                 },
                 "ledger-api": {
                     "error_rate_percent": 0.1,
@@ -209,6 +271,35 @@ _POD_STATUS: dict[Scenario, dict[str, Any]] = {
                 "status": "Running",
                 "ready": True,
                 "restart_count": 0,
+            },
+        ],
+    },
+    Scenario.HEALTHY: {
+        "status": "success",
+        "service": "payment",
+        "pods": [
+            {
+                "name": "payment-api-7d8f9c6b4-x1a2b",
+                "status": "Running",
+                "ready": True,
+                "restart_count": 0,
+                "age_hours": 72,
+            },
+            {
+                "name": "payment-api-7d8f9c6b4-y3c4d",
+                "status": "Running",
+                "ready": True,
+                "restart_count": 0,
+                "age_hours": 72,
+            },
+            {
+                # One restart three days ago during a routine deploy. Benign,
+                # but a pattern-matching agent may seize on it.
+                "name": "payment-api-7d8f9c6b4-z5e6f",
+                "status": "Running",
+                "ready": True,
+                "restart_count": 1,
+                "age_hours": 71,
             },
         ],
     },
