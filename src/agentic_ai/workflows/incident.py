@@ -16,6 +16,7 @@ from typing import Literal, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from agentic_ai.agents.investigation import InvestigationError, investigate
+from agentic_ai.domain.escalation import evaluate
 from agentic_ai.domain.incident import Severity
 from agentic_ai.domain.investigation import InvestigationResult
 from agentic_ai.llm.severity import SeverityAssessment, assess_severity
@@ -71,9 +72,15 @@ def route_by_severity(
 ) -> Literal["urgent", "normal"]:
     """Decide what happens now that the incident has been investigated.
 
-    Deterministic on purpose: the LLM assessed severity and produced findings,
-    but whether that warrants paging a human is a policy decision, not a
-    model's judgement.
+    Deterministic on purpose, and based on the *evidence* rather than the
+    model's reading of it. Severity is assessed from the incident description
+    before any data exists, so it cannot be the only input: a report phrased
+    mildly can turn out to be serious once the numbers are in.
+
+    A live run made the case for this plainly. The model looked at a 34% error
+    rate and a dependency failing 97% of requests, then wrote "the payment
+    service is operating with a low error rate of 34.0%". Code comparing
+    34.0 > 5.0 cannot make that mistake.
     """
     assessment = state["severity_assessment"]
 
@@ -87,6 +94,11 @@ def route_by_severity(
     # regardless of how mild the incident first appeared.
     investigation = state["investigation"]
     if investigation is None or not investigation.is_complete:
+        return "urgent"
+
+    # The description looked mild and the investigation finished - so let the
+    # gathered numbers have the final say.
+    if evaluate(investigation.evidence):
         return "urgent"
 
     return "normal"

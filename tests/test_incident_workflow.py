@@ -3,10 +3,16 @@ import pytest
 from agentic_ai.agents.investigation import InvalidConclusionError
 from agentic_ai.domain.incident import Severity
 from agentic_ai.domain.investigation import (
+    Evidence,
     InvestigationResult,
     TerminationReason,
 )
 from agentic_ai.llm.severity import SeverityAssessment
+from agentic_ai.tools.mock_tools import (
+    Scenario,
+    get_mock_metrics,
+    get_mock_pod_status,
+)
 from agentic_ai.workflows import incident as workflow_module
 from agentic_ai.workflows.incident import handle_incident, route_by_severity
 
@@ -15,14 +21,32 @@ def _assessment(severity: Severity) -> SeverityAssessment:
     return SeverityAssessment(severity=severity, reasoning="test reasoning")
 
 
+def _evidence(scenario: Scenario) -> list[Evidence]:
+    """Real tool output, so the escalation policy has numbers to read."""
+    return [
+        Evidence(
+            source_tool=name,
+            tool_arguments={"service": "payment"},
+            raw_output=tool("payment", scenario),
+            observation=f"{name} returned data",
+        )
+        for name, tool in (
+            ("get_mock_metrics", get_mock_metrics),
+            ("get_mock_pod_status", get_mock_pod_status),
+        )
+    ]
+
+
 def _result(
     termination: TerminationReason = TerminationReason.COMPLETED,
+    scenario: Scenario = Scenario.HEALTHY,
 ) -> InvestigationResult:
     return InvestigationResult(
-        summary="Connection pool exhausted.",
+        summary="Investigation summary.",
         model_assessed_confidence=0.8,
-        recommended_next_action="Increase pool size.",
+        recommended_next_action="No action required.",
         termination_reason=termination,
+        evidence=_evidence(scenario),
     )
 
 
@@ -139,3 +163,37 @@ def test_router_requires_a_severity_assessment() -> None:
                 "next_step": None,
             }
         )
+
+
+# --- escalation on evidence ---------------------------------------------
+
+
+def test_evidence_escalates_even_when_severity_looks_mild(
+    stub_dependencies,
+) -> None:
+    """A mildly-worded report with alarming numbers must still escalate.
+
+    Severity is assessed from the description before any data exists, so it
+    cannot be the only input to the decision.
+    """
+    stub_dependencies(
+        Severity.LOW,
+        investigation=_result(scenario=Scenario.UPSTREAM_DEPENDENCY_FAILURE),
+    )
+
+    assert handle_incident("Occasional checkout hiccups")["next_step"] == "escalate"
+
+
+def test_no_evidence_escalates(stub_dependencies) -> None:
+    """An incident nobody could gather data on needs a human."""
+    stub_dependencies(
+        Severity.LOW,
+        investigation=InvestigationResult(
+            summary="Nothing gathered.",
+            model_assessed_confidence=0.1,
+            recommended_next_action="Escalate.",
+            termination_reason=TerminationReason.COMPLETED,
+        ),
+    )
+
+    assert handle_incident("Something odd")["next_step"] == "escalate"
