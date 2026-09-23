@@ -32,12 +32,19 @@ def test_invalid_severity_is_rejected():
 
 
 def test_assess_severity_live():
+    """End-to-end against the real model.
+
+    Asserts a *range* rather than an exact value. The model returns CRITICAL
+    for this input most of the time and HIGH occasionally; pinning the exact
+    label made the suite fail at random, which trains you to ignore failures.
+    What matters for routing is that a total outage lands in the severe band.
+    """
     assessment = assess_severity(
         "Database is completely down and all customers are affected."
     )
 
     assert isinstance(assessment, SeverityAssessment)
-    assert assessment.severity == Severity.CRITICAL
+    assert assessment.severity in {Severity.HIGH, Severity.CRITICAL}
     assert assessment.reasoning
 
 
