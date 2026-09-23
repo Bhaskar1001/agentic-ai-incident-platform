@@ -3,8 +3,9 @@
 > Single source of truth for this project: what it is, why it exists, what has been built in each
 > phase, and the reasoning behind every significant decision.
 >
-> **Last updated:** 2026-09-07 · **Current phase:** Phase 5 complete — the full pipeline (assess →
-> investigate → route) runs end-to-end against a local model on two scenarios. Phase 6 (RAG) next.
+> **Last updated:** 2026-09-08 · **Current phase:** Phase 5 complete — the full pipeline (assess →
+> investigate → route) runs end-to-end against a local model on three scenarios, including a healthy
+> service. Escalation is now decided by deterministic policy over raw evidence. Phase 6 (RAG) next.
 
 ---
 
@@ -112,7 +113,8 @@ projects collapse under their own weight.
 
 ```
 src/agentic_ai/
-├── domain/       Business entities and their invariants (Incident, Severity, lifecycle rules)
+├── domain/       Business entities, their invariants, and safety policy
+│                (Incident lifecycle, Evidence/Finding, escalation thresholds)
 ├── llm/          Stateless LLM capabilities (one call in, structured output out)
 ├── tools/        The agent's perceptual world — what it can observe
 ├── agents/       Autonomous reasoning: the bounded investigation loop
@@ -732,19 +734,210 @@ An unplanned improvement appeared: the model began **citing its sources inline**
 attributing each claim to the tool that produced it. That emerged from the *"only state facts you
 actually observed"* rule, and it is exactly the traceability the `Evidence` model exists to provide.
 
+#### 5f. The healthy-service scenario, and moving escalation into code ✅
+
+**Goal:** both existing scenarios contain a real fault, so the agent has never had the option of
+being wrong by *inventing* one. Models are strongly biased toward finding something when told to
+investigate. This tests whether it can say "nothing is wrong".
+
+**Built:** a `HEALTHY` scenario — but deliberately not a blank page. A perfectly silent fixture
+would be an unrealistically easy test, so it carries the kind of benign noise real systems always
+have:
+
+| Signal | Value | Purpose |
+|---|---|---|
+| Error rate | 0.2% | Nominal, not zero |
+| DB pool | 18/100 | Plenty of headroom |
+| Latency p95 | 120 ms | Fine |
+| Circuit breakers | all closed | Both dependencies healthy |
+| Logs | 3× INFO, **1× WARN** | *"Retry succeeded on second attempt"* |
+| Pods | all ready, **1 restart** | From a routine deploy 71 h ago |
+
+That WARN and that restart are the bait. The correct answer is that a retry which succeeded and an
+old restart are not an incident.
+
+**Baseline first, on purpose.** Before changing anything, the scenario was run against the
+*unmodified* prompt. Fixing the prompt pre-emptively would have made it impossible to know whether
+the problem was real or imagined.
+
+**Result — it fabricated a fault:**
+
+> Finding: **"The payment service is not handling the logs correctly."** *(confidence 0.8)*
+> Action: *"Investigate the log handling configuration…"*
+
+No such problem exists, and it contradicted itself in the same summary: *"the logs do not contain
+any explicit error messages."* Notably it did **not** take the planted bait — it invented an
+entirely new *category* of fault out of the logs being clean. **Told to find a root cause, "there
+isn't one" was not an available answer, so it manufactured one.**
+
+Two things degraded gracefully and are worth crediting: confidence fell to `0.3` (against `0.8` on
+real incidents), and the deterministic router still sent it to `monitor` rather than `escalate`.
+**The guardrail held while the model's output was worthless** — the strongest argument so far for
+keeping routing in code.
+
+**Diagnosis: both prompts were leading.**
+
+| | Before | After |
+|---|---|---|
+| System | *"Your job is to find the **ROOT CAUSE**"* | *"determine what the evidence **actually shows** … sometimes the service is healthy. **Both are valid conclusions.**"* |
+| Summariser | *"stating **what is wrong** with the service and why"* | *"stating what the evidence shows … **if operating normally, say that plainly** rather than manufacturing a problem"* |
+
+The summariser was probably the worse offender, since it authored the fabricated finding. Two
+explicit guards were added: *"Reporting a problem the evidence does not support is a serious error,
+worse than reporting nothing"*, and *"Healthy systems still produce routine noise: a retry that
+succeeded, an old restart, a warning that resolved itself. Do not treat routine noise as a fault."*
+
+**Result after the fix:** *"running and healthy … no error messages or concerning activity"*,
+confidence `0.9`, action *"continue monitoring"*. Every finding a real observation. Confidence went
+**up**, because the conclusion is now genuinely supported.
+
+##### The re-test exposed two further problems
+
+**1. Overcorrection in the model.** On the upstream scenario it wrote *"the payment service is
+operating with a **low error rate of 34.0%**"*. It read the number correctly and attached the wrong
+judgement — taught that "healthy" is a valid conclusion, it began seeing health that was not there.
+
+**2. A routing bug — mine, not the model's.** A 97% upstream failure rate routed to `monitor`.
+
+`route_by_severity` consulted only `severity_assessment`, which is produced from the incident
+*description* **before any investigation runs**. The flow had been reordered specifically so routing
+could use findings — and then the router was written to ignore them. Worse, the live runs showed all
+three scenarios being assessed `low` from a neutral description, so under the old logic **every one
+of them, including the 97% failure, would have gone to `monitor`.**
+
+##### Fix: `domain/escalation.py`
+
+Escalation now reads the **raw tool JSON** and applies explicit thresholds:
+
+| Rule | Operator | Threshold |
+|---|---|---|
+| Error rate | `>` | 5.0 % |
+| DB pool utilisation | `>=` | 90.0 % |
+| p95 latency | `>` | 2 000 ms |
+| Upstream dependency error rate | `>` | 10.0 % |
+| Circuit breaker open | — | any |
+| Pod not ready | — | any |
+| No evidence / unreadable evidence | — | always escalates |
+
+This also immunises the system against problem 1 above: code comparing `34.0 > 5.0` cannot decide
+that 34% is low. The model's job is finding and explaining; whether numbers justify paging someone
+is policy, and policy reads the numbers rather than the model's characterisation of them.
+
+**A safety bug found while reviewing the new policy.** Unparseable output — malformed JSON, an empty
+string, an error-shaped result — originally produced *no reasons*, so it fell through to "do not
+escalate". An incident where every tool returned garbage would have been silently marked healthy.
+**Absence of readable evidence had become evidence of absence** — the same class of error as the
+model's fabrication, inverted, sitting in the layer written to be trustworthy. Unreadable evidence
+now escalates, and says which source could not be read.
+
+**Boundary tests.** `tests/test_escalation.py` (41 tests, no LLM) pins each rule at its exact
+threshold — `5.0 → no`, `5.01 → yes`; `89.99 → no`, `90.0 → yes`; `2000 → no`, `2001 → yes` — so an
+accidental `>` / `>=` swap fails loudly. It also covers malformed JSON, wrongly-typed fields, missing
+keys, error-shaped output, healthy evidence, and several rules tripping at once.
+
+**A flaky test was fixed, not weakened.** `test_assess_severity_live` asserted the model returns
+exactly `CRITICAL`; it sometimes returns `HIGH` for the same input. It now asserts the severe *band*.
+A suite that fails at random trains you to ignore failures — and what actually matters for routing is
+that a total outage lands in the severe band, not which of two labels it picks.
+
+##### The fix over-corrected, and a repeated run caught it
+
+Re-running the same three scenarios a second time — same code, same prompts — produced a **worse**
+failure than the one just fixed. On the upstream scenario, where the service's own error rate is 34%,
+p95 latency is 10.2 seconds and the circuit breaker is open, the agent reported:
+
+> *"The payment service is **not experiencing errors** and customers can complete checkout."*
+> *"The upstream service 'card-authorization-api' is experiencing a high error rate (97.0%) but
+> **this is not affecting the payment service**."*
+>
+> — both at confidence **1.0**, recommended action: *"Continue monitoring"*
+
+A confident all-clear during an active outage. Materially worse than the earlier *"34% is low"*,
+which was a mislabelled number rather than a wrong verdict.
+
+**The healthy-scenario fix caused it.** The prompt had been given *"Evidence that the service's own
+resources are healthy is meaningful, not a dead end"* — and in this scenario the pods genuinely
+**are** all ready, because the fault is upstream. The model took one healthy signal and generalised
+it to the whole service. One failure mode had been traded for another.
+
+> **Healthy infrastructure is not a healthy service.** Pods can all be ready while a third of
+> requests fail. These are different claims about different things, and a prompt that praises
+> "evidence of health" without qualification invites the model to conflate them.
+
+The prompt now states this explicitly — *"The service is only healthy if its own error rate and
+latency are normal too. If requests are failing or slow, there IS an incident, whatever is causing it
+and however healthy the pods look"* — and names *"reporting that a failing service is fine"* as an
+error of the same seriousness as fabricating a fault. After the fix the same scenario produced
+*"The payment service is **not healthy** … The service's own error rate is 34.0%, indicating that it
+is experiencing errors"*, severity `critical`, confidence 0.9.
+
+##### What repeated runs revealed: behavioural variance
+
+The single most useful thing about running the same three scenarios more than once was discovering
+that **they do not fail the same way twice**:
+
+| Scenario | Run 1 | Run 2 | Run 3 (after fix) |
+|---|---|---|---|
+| Pool exhaustion | Partly right; 2 factual errors | **Correct** | Correct; p95/p99 slip |
+| Upstream | Correct | **False all-clear at 1.0** | **Correct**, "not healthy" |
+| Healthy | Correct, 3 findings | Correct, **0 findings** | Correct, 3 findings |
+
+No run was clean, and each failed in a different place. A single passing run would have justified
+shipping any of these states. The lesson generalises beyond this project: **with a non-deterministic
+component, one green run is an anecdote.** This is the concrete argument for the golden-test suites
+planned in Phase 13 — a behaviour that appears fixed may simply not have recurred yet.
+
+##### The deterministic layer earned its place
+
+Across every run above, including the one that declared an active outage healthy, **routing was
+correct every single time.** `escalate` fired on both failure scenarios and stayed off for the
+healthy one, because `domain/escalation.py` reads `error_rate_percent: 34.0` from the raw tool JSON
+and compares it to a threshold, rather than reading the model's sentence about it.
+
+This is the clearest vindication so far of the project's central principle. The model's narrative was
+wrong in three separate ways across three runs — a fabricated fault, a false all-clear, a
+percentile misread — and not one of them reached the routing decision. **The LLM's semantic
+interpretation can flatly contradict the numeric evidence it just read; the safety boundary must
+therefore consume the numbers, never the interpretation.**
+
+The residual exposure is worth naming plainly: routing is protected, but the human still reads the
+model's `summary` and `recommended_next_action`. A wrong narrative attached to a correct route can
+still mislead the person acting on it.
+
+##### A duplicate-reason bug the tests did not catch
+
+The confirmation run surfaced a defect in the new policy itself. Scenario 1 returned **five**
+escalation reasons, with `"2 of 3 pods not ready"` appearing twice.
+
+The agent had called `get_mock_pod_status` twice — the prompt asks it not to repeat calls, but that
+is a request, not a guarantee — producing two identical `Evidence` records, and `evaluate` reported
+the same observation once per record.
+
+Safety impact was nil: duplication can only add reasons, never remove them, and the incident
+escalated correctly. But a reader seeing that line twice would reasonably infer two separate
+problems. Reasons are a set of distinct facts, not a log of checks performed.
+
+Worth recording *why it slipped through*: the existing test
+`test_all_tripped_rules_are_reported_together` asserts `len(decision.reasons) == 5`. **Counting
+reasons is not the same as checking they are distinct** — the assertion would have passed on the
+duplicated output. Fixed with an order-preserving `dict.fromkeys()`, plus two tests: one driving
+repeated evidence, one confirming that deduplication does not collapse genuinely different
+observations.
+
 ---
 
 ## 5. Current State
 
-**Test suite: 67 passing** (11 incident · 4 severity · 8 workflow · 16 mock tools · 16 investigation ·
-12 investigation domain/registry)
+**Test suite: 123 passing** (43 escalation · 39 mock tools · 16 investigation · 11 incident ·
+10 workflow · 4 severity). Exactly one touches the live model; the rest are deterministic.
 
 ```
 src/agentic_ai/
 ├── domain/
 │   ├── incident.py          Incident, Severity, IncidentStatus, transition_to()
-│   └── investigation.py     Evidence, Finding, TimelineEntry, InvestigationResult,
-│                            TerminationReason, TimelineEventType
+│   ├── investigation.py     Evidence, Finding, TimelineEntry, InvestigationResult,
+│   │                        TerminationReason, TimelineEventType
+│   └── escalation.py        Deterministic escalation policy over raw evidence
 ├── llm/severity.py          SeverityAssessment, assess_severity(), custom exceptions
 ├── tools/
 │   ├── mock_tools.py        get_mock_logs/metrics/pod_status(), MockService
@@ -779,7 +972,10 @@ main
 | Linter / formatter | Not set up | `ruff` or `black`; stray-whitespace artifacts already seen |
 | Git author identity | Unconfigured | Commits carry an auto-guessed name/email on a public repo |
 | Model-assessed confidence calibration | Unknown | Ordering looks sensible; true calibration is a Phase 13 question |
-| Prompt robustness | Improved | Verified on two scenarios; a third (e.g. "nothing is wrong") would test whether it can decline to find a problem |
+| Prompt robustness | Improved | Verified on three scenarios including a healthy service. A fourth (partial/ambiguous evidence) remains untested |
+| Behavioural variance across runs | Open | The same scenarios do not fail the same way twice. One green run proves little; this is the concrete case for Phase 13 golden tests |
+| Escalation thresholds | Provisional | The numbers (5%, 90%, 2000ms, 10%) are reasonable defaults, not tuned against real incident data |
+| Model narrative misstates observed values | Open | Recurring, not a one-off. Across live runs it reported p95 as 5100ms (the fixture's p99; p95 is 2400), called a 12.5% error rate "within normal ranges" at 0.8 confidence, and called 34% "low". Routing is unaffected because escalation reads raw numbers, but the summary a human reads can be wrong, and `recommended_next_action` is model-authored. A Phase 13 evaluation target |
 
 ---
 
@@ -849,3 +1045,21 @@ Extracted from decisions actually made in this project, not aspirational:
     provides guarantees.
 16. **Test a second case before believing the first.** One passing scenario cannot distinguish
     reasoning from pattern-matching, and a prompt tuned on one example is a prompt overfitted to it.
+17. **A leading question gets a leading answer.** "Find the root cause" made "nothing is wrong" an
+    unavailable answer, and the model invented a fault rather than return empty-handed. Prompts must
+    make the negative conclusion explicitly available.
+18. **Absence of evidence is not evidence of absence.** Unreadable tool output must escalate, not
+    fall through to "nothing tripped a threshold". This bug was in the deterministic layer written to
+    be trustworthy — safety code needs the same scrutiny as model output.
+19. **Safety decisions read the numbers, not the narrative.** The model called a 34% error rate
+    "low". Code comparing `34.0 > 5.0` cannot. Where a threshold exists, compare against it directly.
+20. **Fix flaky tests by asserting the right thing, not by loosening until green.** A live LLM test
+    asserting one exact label became a band assertion — because the band is what actually matters
+    downstream, not because the strict version was inconvenient.
+21. **With a non-deterministic component, one green run is an anecdote.** The same three scenarios
+    failed in three different places across three runs. Re-run before believing a fix.
+22. **Fixing one failure mode can create its opposite.** Teaching the agent that "healthy" is a valid
+    conclusion made it declare a failing service healthy. Re-test the cases the previous behaviour
+    got right, not only the one being fixed.
+23. **Counting is not checking.** A test asserting `len(reasons) == 5` passed on output containing
+    the same reason twice. Assert the property you care about — distinctness — not a proxy for it.
