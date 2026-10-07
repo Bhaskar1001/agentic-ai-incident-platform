@@ -3,9 +3,10 @@
 > Single source of truth for this project: what it is, why it exists, what has been built in each
 > phase, and the reasoning behind every significant decision.
 >
-> **Last updated:** 2026-09-08 · **Current phase:** Phase 5 complete — the full pipeline (assess →
-> investigate → route) runs end-to-end against a local model on three scenarios, including a healthy
-> service. Escalation is now decided by deterministic policy over raw evidence. Phase 6 (RAG) next.
+> **Last updated:** 2026-10-07 · **Current phase:** Phase 5 complete — the full pipeline (assess →
+> investigate → route) runs end-to-end on three scenarios, including a healthy service, with
+> escalation decided by deterministic policy over raw evidence. The LLM layer now sits behind a
+> provider-agnostic client; OpenRouter is the default, Ollama remains available. Phase 6 (RAG) next.
 
 ---
 
@@ -95,7 +96,9 @@ introduced only when a real problem justifies it, never for its own sake.
 | **Python 3.10** | Ecosystem for AI/LLM tooling is Python-first. | — |
 | **uv** | Fast dependency manager with a real lockfile (`uv.lock`) for reproducible environments; also manages the Python version per-project. | `pip` + `requirements.txt` (no lockfile → non-reproducible installs); `poetry` (mature but slower, heavier CLI). |
 | **Pydantic v2** | Validation *at the boundary*. Used for domain invariants **and** as the schema contract for LLM structured output — one tool for both jobs. | Dataclasses (no validation); manual `if` checks (verbose, easy to forget). |
-| **Ollama + `llama3.2`** | Runs a real open-weight model **locally at zero cost**. Also forces provider-agnostic design from day one rather than coupling to one vendor's SDK. | Anthropic/OpenAI hosted APIs — rejected on cost; revisit if capability becomes the bottleneck. |
+| **OpenRouter (default) + Ollama (kept)** | Hosted, OpenAI-compatible API with free-tier models — chosen after Ollama's local disk footprint became impractical on the development machine. Sits behind `LLMClient`, an abstraction introduced at this point specifically because the project's own stated "provider-agnostic" intent (see below) had not actually been enforced in code until a second real provider existed to prove it against. | Staying Ollama-only — ruled out by disk space, not by design; the project otherwise has no objection to a local model and keeps Ollama working behind the same interface. |
+| **httpx** | Already a transitive dependency via `ollama`; used directly for the OpenRouter HTTP client rather than adding a second HTTP library. | `requests` — no reason to add a second dependency for the same job. |
+| **python-dotenv** | Loads `OPENROUTER_API_KEY` from a local, gitignored `.env` file rather than requiring it to be exported in every shell session. | Plain environment variables only — more portable across shells, but easy to forget to set and harder to keep consistent across a team. |
 | **LangGraph** | Explicit, inspectable **state** across steps; **cycles** (agent loops back to gather more evidence); **interrupts** for human-in-the-loop approval. | LangChain chains alone — fundamentally a linear pipeline; awkward for loops and stateful branching. Plain Python — would work, but we'd hand-roll state management, checkpointing, and interrupts. |
 | **pytest** | Standard, minimal ceremony. Dev-only dependency so it never ships to production. | — |
 | **`src/` layout** | Package is only importable if properly installed, so packaging bugs surface immediately instead of being masked by `sys.path` accidents. | Flat layout — "works on my machine" risk. |
@@ -923,6 +926,99 @@ reasons is not the same as checking they are distinct** — the assertion would 
 duplicated output. Fixed with an order-preserving `dict.fromkeys()`, plus two tests: one driving
 repeated evidence, one confirming that deduplication does not collapse genuinely different
 observations.
+### Phase 5.6 — Provider abstraction, and switching from Ollama to OpenRouter ✅
+
+**Goal:** Ollama's local disk footprint (multiple GB per model, plus the runtime itself) became
+impractical on the development machine. Move to a hosted, free-tier API — OpenRouter — without
+quietly re-coupling the codebase to a single vendor the way it had been coupled to Ollama.
+
+**The gap this closed.** `UPDATESLOG.md`'s own tech-stack table had claimed, since Phase 3, that
+Ollama "forces provider-agnostic design from day one." That was the *intent*, but both LLM call sites
+(`llm/severity.py`, `agents/investigation.py`) imported `ollama` directly and called `ollama.chat()`
+against its specific response shape (`response.message.content`, `.tool_calls[].function.arguments`
+as an already-parsed dict). Nothing had ever tested whether the design was actually
+provider-agnostic, because only one provider had ever existed to test it against.
+
+**Built:**
+
+```
+src/agentic_ai/llm/
+├── client.py                      LLMClient protocol, ChatResponse, ToolCall, get_client()
+└── providers/
+    ├── ollama_provider.py         wraps ollama.chat(), synthesises a tool_call id
+    └── openrouter_provider.py     OpenAI-compatible HTTP client via httpx
+```
+
+`LLMClient` has exactly one method, `complete(messages, tools=None, json_schema=None) ->
+ChatResponse`, because that is the entire surface both call sites ever needed — a one-shot
+structured-output call (severity assessment) and a multi-turn tool-calling loop (investigation).
+Each provider translates its own wire format into `ChatResponse` and back; callers never see
+Ollama's `response.message` or OpenRouter's `response.choices[0].message`.
+
+**Key decisions:**
+
+- **Ollama was kept, not deleted**, specifically so the abstraction would have two real
+  implementations to prove it against. An interface validated by only ever having one provider
+  behind it is not actually validated — the next section shows exactly what that would have hidden.
+- **OpenRouter is the new default** (`LLM_PROVIDER=openrouter` in `.env`), with a free-tier model
+  (`nvidia/nemotron-3-super-120b-a12b:free`, switched from an initial choice of
+  `google/gemma-4-26b-a4b-it:free` after that model's free pool was rate-limited on first live test —
+  confirmed via OpenRouter's own error body, not assumed). Free-tier models on OpenRouter are
+  explicitly documented by OpenRouter as being shared across all users and subject to disappearing
+  or being rate-limited without notice; this is accepted as a known, named operational risk rather
+  than solved with retry logic in this pass — it stays in Known Issues below.
+- **Secrets handling, done at the moment it first mattered.** `.env.example` (committed, no real
+  values) documents the required variables; `.gitignore` now excludes `.env` itself. This closes a
+  gap flagged explicitly as far back as Phase 1 — *"must be added the moment any API key / secret is
+  introduced, before the key touches disk in a tracked file"* — at the actual moment it became true,
+  not after the fact.
+
+**A real security incident during this work, worth recording honestly.** The user's first attempt
+at providing the API key placed it in `.env.example` — the committed template file, not the
+gitignored `.env`. This was caught before any commit or push (`git ls-files .env.example` confirmed
+it was never tracked), but the key had already been typed into the conversation, so the safe
+assumption is that it should be treated as compromised regardless of whether it reached git. The
+file was corrected immediately (secret moved to `.env`, template restored with no value), and key
+rotation was recommended but left as the user's explicit choice to do after confirming the
+integration worked — a judgment call the user made deliberately, not an oversight.
+
+**A real cross-provider bug found by having two providers, exactly as the abstraction was designed
+to surface.** The first live end-to-end investigation against OpenRouter failed with `400 Bad
+Request`. The actual response body (fetched directly, not guessed at) read:
+
+> `messages[3]: tool messages must include a non-empty string tool_call_id`
+
+OpenRouter's OpenAI-compatible API strictly enforces the tool-calling protocol: every assistant
+`tool_calls` entry must carry an `id`, and the matching `tool`-role result message must echo it back
+as `tool_call_id`. Ollama's tool calls have no `id` field at all (confirmed by inspecting
+`ollama._types.Message.ToolCall.model_fields` directly rather than assumed) — this had silently never
+mattered while Ollama was the only provider in existence.
+
+Fixed by making `ToolCall.id` a required field: the Ollama provider synthesises a stable per-response
+id (`call_0`, `call_1`, ...) since it has none of its own, and OpenRouter's provider passes through
+the real id it returns. `agents/investigation.py`'s message construction now threads that id through
+both the assistant message and its matching tool-result message.
+
+> **This is the whole reason Ollama was kept behind the interface rather than deleted.** A
+> single-provider abstraction would have shipped this bug invisibly — there would have been no
+> second wire format to disagree with the first.
+
+**Live verification, not just the mocked suite.** Both the `connection_pool_exhaustion` and
+`healthy` scenarios were re-run end-to-end against the real OpenRouter API after the fix:
+
+- Pool exhaustion: all three tools called, correct diagnosis citing the actual retrieved numbers
+  (100% pool utilisation, 12.5% error rate, p95/p99 reported correctly and not confused — a
+  recurring weakness under the smaller local model in earlier phases), confidence 0.9, routed to
+  `escalate`.
+- Healthy: all three tools called, correctly reported no incident, correctly treated a benign retry
+  warning as routine noise rather than a fault, routed to `monitor` — the Phase 5.5 fabrication fix
+  holds under the new provider, not just under the model it was originally tuned against.
+
+**123 tests passing**, including the one live test, after updating the two test files that had
+monkeypatched `ollama.chat` on the module directly (`test_severity.py`, `test_investigation.py`) to
+instead inject a fake `LLMClient` or patch `get_client()` — a more direct seam that does not need to
+change again if a third provider is ever added.
+
 
 ---
 
@@ -938,7 +1034,12 @@ src/agentic_ai/
 │   ├── investigation.py     Evidence, Finding, TimelineEntry, InvestigationResult,
 │   │                        TerminationReason, TimelineEventType
 │   └── escalation.py        Deterministic escalation policy over raw evidence
-├── llm/severity.py          SeverityAssessment, assess_severity(), custom exceptions
+├── llm/
+│   ├── client.py            LLMClient protocol, ChatResponse, ToolCall, get_client()
+│   ├── severity.py          SeverityAssessment, assess_severity(), custom exceptions
+│   └── providers/
+│       ├── ollama_provider.py       local model, synthesises a tool_call id
+│       └── openrouter_provider.py   hosted, OpenAI-compatible, default provider
 ├── tools/
 │   ├── mock_tools.py        get_mock_logs/metrics/pod_status(), MockService
 │   └── registry.py          build_tool_schemas(), dispatch_tool(), ToolNotFoundError
@@ -947,15 +1048,14 @@ src/agentic_ai/
 └── api/                     (empty — later)
 ```
 
-**Dependencies:** `langgraph>=1.2.11` · `ollama>=0.6.2` · `pydantic>=2.13.5` · *dev:* `pytest>=9.1.1`
+**Dependencies:** `langgraph>=1.2.11` · `httpx>=0.28.1` · `python-dotenv>=1.2.4` ·
+`pydantic>=2.13.5` · `ollama>=0.6.2` (kept, no longer the default) · *dev:* `pytest>=9.1.1`
 
-**Branches:**
+**LLM provider:** OpenRouter by default (`LLM_PROVIDER=openrouter` in `.env`, see `.env.example`),
+model `nvidia/nemotron-3-super-120b-a12b:free`. Ollama remains available via `LLM_PROVIDER=ollama`.
 
-```
-main
- └── feature/incident-domain-and-severity   (Phases 2–3)
-      └── feature/langgraph-incident-workflow   (Phase 4, current) ← mock tools uncommitted here
-```
+**Branches:** everything through Phase 5.5 has been merged to `main` and pushed; Phase 5.6
+(this provider switch) is committed locally on `main`, not yet pushed.
 
 ---
 
@@ -976,6 +1076,8 @@ main
 | Behavioural variance across runs | Open | The same scenarios do not fail the same way twice. One green run proves little; this is the concrete case for Phase 13 golden tests |
 | Escalation thresholds | Provisional | The numbers (5%, 90%, 2000ms, 10%) are reasonable defaults, not tuned against real incident data |
 | Model narrative misstates observed values | Open | Recurring, not a one-off. Across live runs it reported p95 as 5100ms (the fixture's p99; p95 is 2400), called a 12.5% error rate "within normal ranges" at 0.8 confidence, and called 34% "low". Routing is unaffected because escalation reads raw numbers, but the summary a human reads can be wrong, and `recommended_next_action` is model-authored. A Phase 13 evaluation target |
+| Free-tier model availability | Open | OpenRouter free models are shared across all users and can be rate-limited or withdrawn without notice (observed directly: the first model chosen hit a 429 within the same session it was picked). No retry/fallback logic exists yet; a sustained outage of the default model will surface as a 429 to the caller |
+| Exposed API key | Resolved, flagged | A key was briefly typed into `.env.example` (the committed template) instead of `.env`. Caught before any commit or push, corrected immediately, but the key reached the conversation and should be rotated — left as the user's explicit choice, not yet done as of this writing |
 
 ---
 
@@ -1063,3 +1165,10 @@ Extracted from decisions actually made in this project, not aspirational:
     got right, not only the one being fixed.
 23. **Counting is not checking.** A test asserting `len(reasons) == 5` passed on output containing
     the same reason twice. Assert the property you care about — distinctness — not a proxy for it.
+24. **An abstraction with one implementation behind it is untested.** `LLMClient` existed in intent
+    from Phase 3 onward, but nothing enforced it until a second provider existed to disagree with the
+    first. The `tool_call_id` bug was invisible for the entire time Ollama was the only provider — it
+    could only be a bug once something else cared.
+25. **A secret typed into the wrong file is compromised the moment it is typed, not the moment it is
+    committed.** Catching a leak before `git commit` is real and worth doing, but it does not undo the
+    exposure; rotate the credential regardless of whether it reached version control.
