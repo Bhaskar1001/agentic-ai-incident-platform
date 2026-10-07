@@ -11,3 +11,8 @@ wheels/
 
 # Local tooling state
 .claude/
+
+# Secrets - never commit real credentials
+.env
+.env.*
+!.env.example
