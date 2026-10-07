@@ -1,5 +1,4 @@
 import json
-from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +17,7 @@ from agentic_ai.domain.investigation import (
     TerminationReason,
     TimelineEventType,
 )
+from agentic_ai.llm.client import ChatResponse, ToolCall
 from agentic_ai.tools.registry import (
     ToolNotFoundError,
     build_tool_schemas,
@@ -25,19 +25,30 @@ from agentic_ai.tools.registry import (
 )
 
 
-def _tool_call(name: str, **arguments):
-    return SimpleNamespace(
-        function=SimpleNamespace(name=name, arguments=arguments)
-    )
+_next_call_id = iter(f"call_{i}" for i in range(10_000))
 
 
-def _response(content: str = "", tool_calls=None):
-    return SimpleNamespace(
-        message=SimpleNamespace(content=content, tool_calls=tool_calls)
-    )
+def _tool_call(name: str, **arguments) -> ToolCall:
+    return ToolCall(name=name, arguments=arguments, id=next(_next_call_id))
 
 
 ALL_TOOL_NAMES = ("get_mock_logs", "get_mock_metrics", "get_mock_pod_status")
+
+
+class _FakeClient:
+    """A minimal LLMClient stand-in driven by a function of
+    (messages, tools, json_schema) -> ChatResponse, so each test can script
+    exactly what the "model" does on each call without touching any real
+    provider.
+    """
+
+    def __init__(self, respond):
+        self._respond = respond
+        self.calls = 0
+
+    def complete(self, messages, *, tools=None, json_schema=None):
+        self.calls += 1
+        return self._respond(messages=messages, tools=tools, json_schema=json_schema)
 
 
 def _compliant_model(extra_calls=(), final_content="Investigation complete."):
@@ -51,14 +62,20 @@ def _compliant_model(extra_calls=(), final_content="Investigation complete."):
     ]
     index = {"i": 0}
 
-    def fake_chat(**kwargs):
+    def respond(**kwargs):
         i = index["i"]
         index["i"] += 1
         if i < len(planned):
-            return _response(tool_calls=[planned[i]])
-        return _response(content=final_content)
+            return ChatResponse(content="", tool_calls=[planned[i]])
+        return ChatResponse(content=final_content)
 
-    return fake_chat
+    return respond
+
+
+def _patch_client(monkeypatch, respond) -> _FakeClient:
+    client = _FakeClient(respond)
+    monkeypatch.setattr(agent_module, "get_client", lambda: client)
+    return client
 
 
 # --- tool registry -------------------------------------------------------
@@ -93,7 +110,7 @@ def test_dispatch_calls_the_real_tool() -> None:
 
 
 def test_agent_stops_once_coverage_is_met_and_it_stops_asking(monkeypatch) -> None:
-    monkeypatch.setattr(agent_module.ollama, "chat", _compliant_model())
+    _patch_client(monkeypatch, _compliant_model())
 
     state = build_investigation_graph().invoke(_initial_state())
 
@@ -110,16 +127,16 @@ def test_premature_conclusion_is_rejected_until_coverage_is_met(monkeypatch) -> 
                 "get_mock_pod_status", None]
     calls = {"i": 0}
 
-    def fake_chat(**kwargs):
+    def respond(**kwargs):
         index = calls["i"]
         calls["i"] += 1
         tool = sequence[index] if index < len(sequence) else None
         if tool is None:
-            return _response(content="I am done.")
+            return ChatResponse(content="I am done.")
         requested.append(tool)
-        return _response(tool_calls=[_tool_call(tool, service="payment")])
+        return ChatResponse(content="", tool_calls=[_tool_call(tool, service="payment")])
 
-    monkeypatch.setattr(agent_module.ollama, "chat", fake_chat)
+    _patch_client(monkeypatch, respond)
 
     state = build_investigation_graph().invoke(_initial_state())
 
@@ -138,13 +155,15 @@ def test_premature_conclusion_is_rejected_until_coverage_is_met(monkeypatch) -> 
 def test_coverage_enforcement_cannot_loop_past_the_step_budget(monkeypatch) -> None:
     """A model that always calls the same tool must still terminate."""
 
-    def fake_chat(**kwargs):
+    def respond(messages, **kwargs):
         # Always the same tool, then always claims to be done.
-        if kwargs["messages"][-1]["role"] == "tool":
-            return _response(content="Done.")
-        return _response(tool_calls=[_tool_call("get_mock_logs", service="payment")])
+        if messages[-1]["role"] == "tool":
+            return ChatResponse(content="Done.")
+        return ChatResponse(
+            content="", tool_calls=[_tool_call("get_mock_logs", service="payment")]
+        )
 
-    monkeypatch.setattr(agent_module.ollama, "chat", fake_chat)
+    _patch_client(monkeypatch, respond)
 
     state = build_investigation_graph().invoke(_initial_state())
 
@@ -155,10 +174,12 @@ def test_coverage_enforcement_cannot_loop_past_the_step_budget(monkeypatch) -> N
 def test_step_budget_is_enforced_against_a_looping_model(monkeypatch) -> None:
     """A model that never stops must still be stopped by deterministic code."""
 
-    def fake_chat(**kwargs):
-        return _response(tool_calls=[_tool_call("get_mock_logs", service="payment")])
+    def respond(**kwargs):
+        return ChatResponse(
+            content="", tool_calls=[_tool_call("get_mock_logs", service="payment")]
+        )
 
-    monkeypatch.setattr(agent_module.ollama, "chat", fake_chat)
+    _patch_client(monkeypatch, respond)
 
     state = build_investigation_graph().invoke(_initial_state())
 
@@ -172,9 +193,8 @@ def test_step_budget_is_enforced_against_a_looping_model(monkeypatch) -> None:
 
 def test_unknown_tool_is_recoverable_not_fatal(monkeypatch) -> None:
     """A hallucinated tool becomes an observation, not a crash."""
-    monkeypatch.setattr(
-        agent_module.ollama,
-        "chat",
+    _patch_client(
+        monkeypatch,
         _compliant_model(extra_calls=[_tool_call("get_mock_traces", service="payment")]),
     )
 
@@ -195,9 +215,8 @@ def test_unknown_tool_is_recoverable_not_fatal(monkeypatch) -> None:
 
 def test_failed_tool_result_is_still_shown_to_the_model(monkeypatch) -> None:
     """An unknown *service* is a domain error the agent can react to."""
-    monkeypatch.setattr(
-        agent_module.ollama,
-        "chat",
+    _patch_client(
+        monkeypatch,
         _compliant_model(extra_calls=[_tool_call("get_mock_logs", service="billing")]),
     )
 
@@ -212,7 +231,7 @@ def test_failed_tool_result_is_still_shown_to_the_model(monkeypatch) -> None:
 
 def test_evidence_preserves_raw_tool_output_verbatim(monkeypatch) -> None:
     """The core auditability invariant."""
-    monkeypatch.setattr(agent_module.ollama, "chat", _compliant_model())
+    _patch_client(monkeypatch, _compliant_model())
 
     state = build_investigation_graph().invoke(_initial_state())
 
@@ -245,16 +264,14 @@ _VALID_CONCLUSION = json.dumps(
 
 def test_investigate_returns_validated_result(monkeypatch) -> None:
     investigation = _compliant_model()
-    calls = {"i": 0}
 
-    def fake_chat(**kwargs):
-        calls["i"] += 1
+    def respond(json_schema=None, **kwargs):
         # Once the graph has finished, the next call is the summariser.
-        if kwargs.get("format") is not None:
-            return _response(content=_VALID_CONCLUSION)
+        if json_schema is not None:
+            return ChatResponse(content=_VALID_CONCLUSION)
         return investigation(**kwargs)
 
-    monkeypatch.setattr(agent_module.ollama, "chat", fake_chat)
+    _patch_client(monkeypatch, respond)
 
     result = investigate("Payment service is failing")
 
@@ -268,12 +285,12 @@ def test_investigate_returns_validated_result(monkeypatch) -> None:
 def test_invalid_conclusion_raises_after_retry(monkeypatch) -> None:
     investigation = _compliant_model()
 
-    def fake_chat(**kwargs):
-        if kwargs.get("format") is not None:
-            return _response(content='{"summary": "incomplete"}')  # missing fields
+    def respond(json_schema=None, **kwargs):
+        if json_schema is not None:
+            return ChatResponse(content='{"summary": "incomplete"}')  # missing fields
         return investigation(**kwargs)
 
-    monkeypatch.setattr(agent_module.ollama, "chat", fake_chat)
+    _patch_client(monkeypatch, respond)
 
     with pytest.raises(InvalidConclusionError):
         investigate("Payment service is failing")

@@ -12,10 +12,10 @@ Division of responsibility:
 import json
 from typing import Annotated, Any, TypedDict
 
-import ollama
 from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError
 
+from agentic_ai.llm.client import get_client
 from agentic_ai.domain.investigation import (
     Evidence,
     InvestigationResult,
@@ -30,8 +30,6 @@ from agentic_ai.tools.registry import (
     build_tool_schemas,
     dispatch_tool,
 )
-
-MODEL = "llama3.2"
 
 MAX_INVESTIGATION_STEPS = 8
 """One step = reason -> select tool -> execute -> observe.
@@ -126,26 +124,26 @@ _SYSTEM_PROMPT = (
 
 def reason_node(state: InvestigationState) -> dict[str, Any]:
     """Ask the model what to do next, given everything observed so far."""
-    response = ollama.chat(
-        model=MODEL,
+    client = get_client()
+    response = client.complete(
         messages=state["messages"],
         tools=build_tool_schemas(),
     )
 
-    message = response.message
-    tool_calls = message.tool_calls or []
+    tool_calls = response.tool_calls
 
     assistant_message: dict[str, Any] = {
         "role": "assistant",
-        "content": message.content or "",
+        "content": response.content or "",
     }
     if tool_calls:
         assistant_message["tool_calls"] = [
             {
+                "id": call.id,
                 "function": {
-                    "name": call.function.name,
-                    "arguments": call.function.arguments,
-                }
+                    "name": call.name,
+                    "arguments": call.arguments,
+                },
             }
             for call in tool_calls
         ]
@@ -178,6 +176,7 @@ def execute_tools_node(state: InvestigationState) -> dict[str, Any]:
     timeline: list[TimelineEntry] = []
 
     for call in tool_calls:
+        call_id = call["id"]
         name = call["function"]["name"]
         arguments = call["function"]["arguments"]
 
@@ -240,7 +239,14 @@ def execute_tools_node(state: InvestigationState) -> dict[str, Any]:
                 )
             )
 
-        messages.append({"role": "tool", "content": raw_output, "name": name})
+        messages.append(
+            {
+                "role": "tool",
+                "content": raw_output,
+                "name": name,
+                "tool_call_id": call_id,
+            }
+        )
 
     return {
         "messages": messages,
@@ -449,11 +455,12 @@ def _summarise(state: InvestigationState) -> InvestigationResult:
 
     messages = state["messages"] + [{"role": "user", "content": instruction}]
 
+    client = get_client()
     last_error: Exception | None = None
     for _ in range(2):
-        response = ollama.chat(model=MODEL, messages=messages, format=schema)
+        response = client.complete(messages=messages, json_schema=schema)
         try:
-            partial = json.loads(response.message.content)
+            partial = json.loads(response.content)
         except json.JSONDecodeError as exc:
             last_error = exc
             continue

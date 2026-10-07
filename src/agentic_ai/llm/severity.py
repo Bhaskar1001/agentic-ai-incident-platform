@@ -1,8 +1,7 @@
-
-import ollama
 from pydantic import BaseModel, ValidationError
 
 from agentic_ai.domain.incident import Severity
+from agentic_ai.llm.client import LLMClient, get_client
 
 
 class SeverityAssessmentError(Exception):
@@ -18,13 +17,15 @@ class SeverityAssessment(BaseModel):
     reasoning: str
 
 
-def assess_severity(incident_description: str) -> SeverityAssessment:
+def assess_severity(
+    incident_description: str, *, client: LLMClient | None = None
+) -> SeverityAssessment:
+    client = client or get_client()
     schema = SeverityAssessment.model_json_schema()
 
     for attempt in range(2):
         try:
-            response = ollama.chat(
-                model="llama3.2",
+            response = client.complete(
                 messages=[
                     {
                         "role": "user",
@@ -35,16 +36,13 @@ def assess_severity(incident_description: str) -> SeverityAssessment:
                         ),
                     }
                 ],
-                format=schema,
+                json_schema=schema,
             )
 
-            raw_content = response.message.content
-
-            return SeverityAssessment.model_validate_json(raw_content)
+            return SeverityAssessment.model_validate_json(response.content)
 
         except ValidationError as exc:
             if attempt == 1:
                 raise InvalidAssessmentError(
                     "LLM returned invalid severity assessment after retry."
                 ) from exc
-

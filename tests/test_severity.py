@@ -1,9 +1,8 @@
 import pytest
 from pydantic import ValidationError
-from types import SimpleNamespace
 
 from agentic_ai.domain.incident import Severity
-from agentic_ai.llm import severity as severity_module
+from agentic_ai.llm.client import ChatResponse
 from agentic_ai.llm.severity import (
     InvalidAssessmentError,
     SeverityAssessment,
@@ -32,7 +31,7 @@ def test_invalid_severity_is_rejected():
 
 
 def test_assess_severity_live():
-    """End-to-end against the real model.
+    """End-to-end against the real configured LLM provider.
 
     Asserts a *range* rather than an exact value. The model returns CRITICAL
     for this input most of the time and HIGH occasionally; pinning the exact
@@ -48,24 +47,23 @@ def test_assess_severity_live():
     assert assessment.reasoning
 
 
-def test_invalid_llm_output_retries_and_raises_custom_error(monkeypatch):
-    calls = 0
+class _FakeClient:
+    """A minimal LLMClient stand-in for deterministic, LLM-free tests."""
 
-    def fake_chat(**kwargs):
-        nonlocal calls
+    def __init__(self, content: str):
+        self.content = content
+        self.calls = 0
 
-        calls += 1
+    def complete(self, messages, *, tools=None, json_schema=None):
+        self.calls += 1
+        return ChatResponse(content=self.content)
 
-        return SimpleNamespace(
-            message=SimpleNamespace(
-                content='{"severity": "super-critical", "reasoning": "Invalid"}'
-            )
-        )
 
-    monkeypatch.setattr(severity_module.ollama, "chat", fake_chat)
+def test_invalid_llm_output_retries_and_raises_custom_error():
+    fake = _FakeClient('{"severity": "super-critical", "reasoning": "Invalid"}')
 
     with pytest.raises(InvalidAssessmentError) as exc_info:
-        assess_severity("Database is completely down.")
+        assess_severity("Database is completely down.", client=fake)
 
-    assert calls == 2
+    assert fake.calls == 2
     assert isinstance(exc_info.value.__cause__, ValidationError)
