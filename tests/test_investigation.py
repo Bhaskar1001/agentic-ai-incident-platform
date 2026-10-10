@@ -81,18 +81,46 @@ def _patch_client(monkeypatch, respond) -> _FakeClient:
 # --- tool registry -------------------------------------------------------
 
 
-def test_tool_schemas_expose_available_services_as_enum() -> None:
+OBSERVABILITY_TOOL_NAMES = {
+    "get_mock_logs",
+    "get_mock_metrics",
+    "get_mock_pod_status",
+}
+
+
+def test_all_registered_tools_are_exposed() -> None:
+    schemas = build_tool_schemas()
+
+    assert {s["function"]["name"] for s in schemas} == OBSERVABILITY_TOOL_NAMES | {
+        "search_knowledge_base"
+    }
+
+
+def test_observability_tool_schemas_expose_available_services_as_enum() -> None:
     """The model must be told which service names are valid."""
     schemas = build_tool_schemas()
 
-    assert {s["function"]["name"] for s in schemas} == {
-        "get_mock_logs",
-        "get_mock_metrics",
-        "get_mock_pod_status",
-    }
-    for schema in schemas:
+    observability_schemas = [
+        s for s in schemas if s["function"]["name"] in OBSERVABILITY_TOOL_NAMES
+    ]
+    assert len(observability_schemas) == len(OBSERVABILITY_TOOL_NAMES)
+
+    for schema in observability_schemas:
         service = schema["function"]["parameters"]["properties"]["service"]
         assert service["enum"] == ["payment"]
+
+
+def test_knowledge_base_tool_schema_takes_a_query_not_a_service() -> None:
+    """The retrieval tool has nothing to do with the mock service enum."""
+    schemas = build_tool_schemas()
+
+    kb_schema = next(
+        s for s in schemas if s["function"]["name"] == "search_knowledge_base"
+    )
+    properties = kb_schema["function"]["parameters"]["properties"]
+
+    assert "query" in properties
+    assert "service" not in properties
 
 
 def test_dispatch_unknown_tool_raises() -> None:

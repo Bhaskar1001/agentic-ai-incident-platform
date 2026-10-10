@@ -49,6 +49,19 @@ retrieved. Sufficiency of evidence is a boundary, so deterministic code owns
 it rather than the model's discretion.
 """
 
+REQUIRED_TOOLS = frozenset(
+    {"get_mock_logs", "get_mock_metrics", "get_mock_pod_status"}
+)
+"""The mandatory evidence floor - distinct from INVESTIGATION_TOOLS as a whole.
+
+search_knowledge_base is registered and callable but deliberately excluded
+here: it is advisory (does this symptom match a known pattern?), not primary
+evidence about the current incident. Forcing a knowledge-base lookup on every
+investigation, including ones with no relevant precedent, would burn a step
+for no benefit. The observability tools remain the only hard requirement,
+since they are what the escalation policy actually reads.
+"""
+
 
 class InvestigationError(Exception):
     """Base exception for investigation failures."""
@@ -103,6 +116,13 @@ _SYSTEM_PROMPT = (
     "- get_mock_pod_status\n\n"
     "You may call them in whatever order the evidence suggests, but you must "
     "call all three.\n\n"
+    "You also have a search_knowledge_base tool. It is OPTIONAL, not one of "
+    "the three required tools. Use it if the symptoms resemble a problem "
+    "that may have occurred before - it returns past incidents with their "
+    "root cause and resolution. Treat a match as a hypothesis to check "
+    "against the actual evidence you gather, not as a substitute for "
+    "gathering that evidence, and not as a confirmed diagnosis on its "
+    "own.\n\n"
     "Rules:\n"
     "- Call ONE tool per turn.\n"
     "- Do NOT conclude until all three tools have been called.\n"
@@ -285,7 +305,7 @@ def require_more_evidence_node(state: InvestigationState) -> dict[str, Any]:
     Clears ``termination_reason`` so the cycle resumes, and tells the model
     specifically which tools it has not yet used.
     """
-    remaining = sorted(set(INVESTIGATION_TOOLS) - _distinct_tools_used(state))
+    remaining = sorted(REQUIRED_TOOLS - _distinct_tools_used(state))
 
     return {
         "termination_reason": None,
@@ -445,7 +465,7 @@ def _summarise(state: InvestigationState) -> InvestigationResult:
     instruction = _SUMMARY_INSTRUCTION
     used = _distinct_tools_used(state)
     if len(used) < MIN_DISTINCT_TOOLS:
-        missing = sorted(set(INVESTIGATION_TOOLS) - used)
+        missing = sorted(REQUIRED_TOOLS - used)
         instruction += (
             "\n\nIMPORTANT: this investigation is INCOMPLETE. You never "
             f"retrieved data from: {', '.join(missing)}. Do not state facts "
