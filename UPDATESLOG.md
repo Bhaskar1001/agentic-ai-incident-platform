@@ -3,11 +3,13 @@
 > Single source of truth for this project: what it is, why it exists, what has been built in each
 > phase, and the reasoning behind every significant decision.
 >
-> **Last updated:** 2026-10-10 · **Current phase:** Phase 6 complete — the investigation agent can
-> optionally retrieve similar past incidents from a synthetic knowledge base via a
-> search_knowledge_base tool, backed by local sentence-transformer embeddings and in-memory cosine
-> similarity search. The three observability tools remain the only mandatory evidence floor; retrieval
-> is advisory, and the agent decides when consulting it is worthwhile. Phase 7 (multi-agent) next.
+> **Last updated:** 2026-10-10 · **Current phase:** Phase 7 complete — escalating incidents now get
+> a synthesized root cause analysis (primary cause, alternatives, cited findings, knowledge-base
+> consistency), produced as a single structured-output call rather than a second agent loop. The
+> investigation agent from Phase 5 (with the optional knowledge-base retrieval from Phase 6)
+> remains the only looping agent in the system; no Supervisor exists yet, since two steps in a fixed
+> sequence give it no real decision to make. Phase 7 continuation (more agents / a Supervisor) or
+> Phase 8 (memory) next.
 
 ---
 
@@ -1115,27 +1117,138 @@ integrity, the symptom/answer separation invariant, real-embedding retrieval qua
 deliberately-hard pairs, and the agent-facing tool's JSON contract and error handling; plus 2 tests in
 `test_investigation.py` split and extended to cover the generalised registry (one asserting the full
 4-tool schema set, one confirming the knowledge-base tool's schema has no `service` parameter).
+### Phase 7 — Root cause analysis: the second reasoning step, deliberately not a second agent ✅
+
+**Goal:** the Investigation Agent's `findings[]` are per-observation statements produced *while*
+gathering evidence, under the constraint of also deciding what to look at next. Synthesizing those
+findings into one coherent root cause, weighing alternatives, and checking consistency against a
+retrieved precedent is a genuinely distinct reasoning task - but it is not another evidence-gathering
+loop, and building it as a second agent would have been complexity the task does not need.
+
+**Scoped deliberately narrow before any code.** The project's roadmap lists five potential agents
+(Investigation, Knowledge, RCA, Remediation Planner, Verification) plus a Supervisor. Built one new
+piece: RCA. No Supervisor yet, since with only two steps in the pipeline (Investigation, then RCA)
+there is no actual routing decision between multiple agents for a Supervisor to make - introducing one
+now would be exactly the premature-infrastructure pattern this project has repeatedly rejected
+elsewhere (the vector-database decision in Phase 6, the "no database until a problem demands one"
+principle stated from Phase 1 onward).
+
+**Built:**
+
+```
+src/agentic_ai/
+├── domain/rca.py       RootCauseAnalysis, AlternativeHypothesis, KnowledgeBaseConsistency
+└── llm/rca.py          analyze_root_cause() - one structured-output call, no tools, no loop
+```
+
+**The `llm/` vs `agents/` placement, decided on shape rather than the roadmap's word "agent".**
+RCA takes a finished `InvestigationResult`, makes one structured-output LLM call, and returns a
+result - architecturally identical to `assess_severity()` in `llm/severity.py`, not to the looping
+`agents/investigation.py`. The roadmap calls it an "RCA Agent" because that is its conceptual role in
+the pipeline; the code is named for what it actually is. This is also what the Phase 4 `workflows/`
+vs `agents/` boundary question - left open since LangGraph was introduced - was actually resolved by:
+`workflows/` is graph wiring, `agents/` means a loop that reasons over accumulating state and chooses
+its own next action, `llm/` is a stateless one-shot capability. RCA fits the third category cleanly,
+and forcing it into `agents/` to match the roadmap's vocabulary would have made that boundary mean
+nothing.
+
+**RCA has no tool access, enforced structurally.** The prompt built in `llm/rca.py` never offers
+`tools=` to the LLM client - there is nothing for the model to call even if it wanted to re-query the
+knowledge base or re-check a metric. Investigation gathers; RCA synthesizes. This mirrors the same
+discipline that keeps `InvestigationResult`'s own summariser from authoring `evidence` or
+`termination_reason`: the boundary is in what the model is offered, not in an instruction asking it
+to behave.
+
+**Revisited a deliberate Phase 5 deferral, now that something concrete needed it.** `Finding` gained
+an `id: UUID` field. Phase 5's `UPDATESLOG` entry had explicitly flagged `supporting_evidence_ids` as
+"needed for RCA... premature now" - this is that exact deferral being closed at the moment RCA
+actually required it, not speculatively earlier. The field has a `default_factory`, so no prompt or
+LLM output needed to change to accommodate it; all 142 then-existing tests passed unchanged.
+
+**Citations are validated, not trusted.** `RootCauseAnalysis.supporting_finding_ids` is checked
+against the real `Finding.id` values present in the input before being accepted; an unresolvable
+citation is treated as invalid structured output and retried, the same way an invalid enum value or a
+malformed JSON body already are elsewhere in this project. The alternative - logging a warning and
+accepting it anyway - would let a fabricated citation sit in the result looking exactly as
+authoritative as a real one.
+
+**The mandatory-vs-advisory distinction from Phase 6 generalises here.** Just as
+`search_knowledge_base` is optional for the Investigation Agent, RCA's own use of knowledge-base
+results is read from whatever `Evidence` the investigation happened to produce
+(`source_tool == "search_knowledge_base"`), not fetched fresh. If no search was performed,
+`knowledge_base_consistency` is expected to be `no_relevant_precedent` rather than the model
+inventing a precedent to discuss.
+
+**Where RCA sits in the workflow, decided to preserve the Phase 5.5 escalation principle.**
+
+```
+assess_severity -> investigate -> route_by_severity -+- urgent -> analyze_root_cause -> escalate
+                                                       `- normal -> monitor
+```
+
+RCA runs strictly *after* routing, on the escalation path only. Two reasons, both load-bearing:
+- An incident routed to `monitor` was not an incident; there is no root cause to explain, and running
+  RCA anyway would spend an LLM call for nothing.
+- `route_by_severity` must keep deciding escalation from raw evidence alone, the principle Phase 5.5
+  fought hard to establish after watching an LLM call a 34% error rate "low". Running RCA before
+  routing - or worse, letting routing read RCA's output - would reopen exactly that risk by handing a
+  safety decision to narrative instead of numbers. A test
+  (`test_routing_is_unaffected_by_rca_regardless_of_its_content`) pins this directly: a
+  deliberately low-confidence RCA result must not change a routing decision severity has already
+  made, since RCA runs strictly after that decision in the graph.
+- `analyze_root_cause_node` also skips RCA whenever the investigation produced no findings or failed
+  outright - nothing to synthesize in either case - and a failure inside RCA itself does not block
+  escalation: a human is already being paged, and an unexplained incident with no RCA is still better
+  handed to a human than silently dropped. Only genuinely unexpected errors (not
+  `RootCauseAnalysisError`) propagate, the same failure-category discipline used everywhere else in
+  this project.
+
+**Live-verified end to end, with one honest gap.** On `connection_pool_exhaustion`: the agent
+investigated, retrieved RB-001 from the knowledge base on its own judgement (Phase 6 behaviour
+unchanged), and RCA produced a root cause citing 5 real finding ids, correctly judged the knowledge
+base result `supported`, and proposed two alternative hypotheses (thread-pool starvation, TLS
+certificate expiry) with specific discriminating evidence for ranking each below the primary
+conclusion rather than generic hedging. On `upstream_dependency_failure`: correct diagnosis, `escalate`,
+knowledge base `supported` at 0.98 confidence. The `healthy` scenario could not be re-verified live in
+this session - OpenRouter's shared free-tier pool returned `429 Too Many Requests` on repeated
+attempts, the same documented risk flagged in Phase 5.6 ("no retry/fallback logic exists yet"), not a
+Phase 7 regression. The "RCA does not run on the monitor path" behaviour is still fully verified at
+the unit level (`test_rca_does_not_run_on_the_monitor_path`, deterministic, no LLM involved) - this
+gap is specifically "not reconfirmed live this session," not "unverified."
+
+**161 tests total, 160 passing in this session** (the one failure being the live-model rate limit
+above, environmental, not a code defect): 12 new in `tests/test_rca.py` (domain model validation,
+prompt-section rendering, citation validation including the retry-then-raise path), 7 new in
+`test_incident_workflow.py` covering the full RCA integration matrix (runs when expected, skipped on
+the monitor path, skipped with no findings, skipped when investigation itself failed, a failure inside
+RCA does not block escalation, unexpected errors still propagate, and routing is provably unaffected
+by RCA's content).
 
 
 ---
 
 ## 5. Current State
 
-**Test suite: 142 passing** (43 escalation · 39 mock tools · 18 investigation · 17 knowledge ·
-11 incident · 10 workflow · 4 severity). Exactly one touches the live LLM; the knowledge tests load
-a real local embedding model but no LLM; the rest are fully deterministic.
+**Test suite: 161 tests** (43 escalation · 39 mock tools · 18 investigation · 17 knowledge ·
+12 rca · 17 workflow · 11 incident · 4 severity). Exactly one touches the live LLM directly
+(`test_assess_severity_live`); the knowledge tests load a real local embedding model but no LLM; the
+rest are fully deterministic. 160 passed as of this writing - the live test failed on a transient
+OpenRouter free-tier 429, not a code defect (see Known Issues).
 
 ```
 src/agentic_ai/
 ├── domain/
 │   ├── incident.py          Incident, Severity, IncidentStatus, transition_to()
-│   ├── investigation.py     Evidence, Finding, TimelineEntry, InvestigationResult,
-│   │                        TerminationReason, TimelineEventType
+│   ├── investigation.py     Evidence, Finding (now with id), TimelineEntry,
+│   │                        InvestigationResult, TerminationReason, TimelineEventType
 │   ├── escalation.py        Deterministic escalation policy over raw evidence
-│   └── knowledge.py         KnowledgeEntry, KnowledgeSearchResult
+│   ├── knowledge.py         KnowledgeEntry, KnowledgeSearchResult
+│   └── rca.py               RootCauseAnalysis, AlternativeHypothesis,
+│                            KnowledgeBaseConsistency
 ├── llm/
 │   ├── client.py            LLMClient protocol, ChatResponse, ToolCall, get_client()
 │   ├── severity.py          SeverityAssessment, assess_severity(), custom exceptions
+│   ├── rca.py                analyze_root_cause() - one call, no tools, no loop
 │   └── providers/
 │       ├── ollama_provider.py       local model, synthesises a tool_call id
 │       └── openrouter_provider.py   hosted, OpenAI-compatible, default provider
@@ -1146,7 +1259,7 @@ src/agentic_ai/
 │   ├── knowledge_retrieval.py embed-once, in-memory cosine similarity search
 │   └── search_tool.py         search_knowledge_base(), the agent-facing tool
 ├── agents/investigation.py  bounded ReAct subgraph, investigate(), coverage enforcement
-├── workflows/incident.py    assess -> investigate -> route, handle_incident()
+├── workflows/incident.py    assess -> investigate -> route -> [RCA] -> escalate/monitor
 └── api/                     (empty — later)
 ```
 
@@ -1182,6 +1295,7 @@ model `nvidia/nemotron-3-super-120b-a12b:free`. Ollama remains available via `LL
 | Escalation thresholds | Provisional | The numbers (5%, 90%, 2000ms, 10%) are reasonable defaults, not tuned against real incident data |
 | Model narrative misstates observed values | Open | Recurring, not a one-off. Across live runs it reported p95 as 5100ms (the fixture's p99; p95 is 2400), called a 12.5% error rate "within normal ranges" at 0.8 confidence, and called 34% "low". Routing is unaffected because escalation reads raw numbers, but the summary a human reads can be wrong, and `recommended_next_action` is model-authored. A Phase 13 evaluation target |
 | Free-tier model availability | Open | OpenRouter free models are shared across all users and can be rate-limited or withdrawn without notice (observed directly: the first model chosen hit a 429 within the same session it was picked). No retry/fallback logic exists yet; a sustained outage of the default model will surface as a 429 to the caller |
+| Free-tier rate limit recurred in Phase 7 | Open | Confirmed again, not just a one-off: adding an RCA call per escalating incident increases free-pool consumption, and a live verification run hit 429 on retry within the same session. No retry/backoff exists; this is now two independent confirmations of the same documented risk, worth addressing before relying on live runs for anything time-sensitive |
 | Exposed API key | Resolved, flagged | A key was briefly typed into `.env.example` (the committed template) instead of `.env`. Caught before any commit or push, corrected immediately, but the key reached the conversation and should be rotated — left as the user's explicit choice, not yet done as of this writing |
 
 ---
@@ -1196,7 +1310,7 @@ model `nvidia/nemotron-3-super-120b-a12b:free`. Ollama remains available via `LL
 | 4 | LangGraph — state, nodes, routing | ✅ |
 | 5 | Investigation agent + mock tools | ✅ |
 | 6 | RAG — engineering knowledge retrieval | ✅ |
-| 7 | Multi-agent — supervisor, RCA, remediation planner | ⬜ |
+| 7 | Multi-agent — RCA done; supervisor, remediation planner remain | 🚧 |
 | 8 | Memory — short-term, long-term, vector | ⬜ |
 | 9 | MCP & tool engineering | ⬜ |
 | 10 | Guardrails — risk tiers, approval gates | ⬜ |
@@ -1285,3 +1399,13 @@ Extracted from decisions actually made in this project, not aspirational:
 27. **Test retrieval on the hard pairs, not the easy ones.** A corpus where every document is
     trivially distinct proves nothing about ranking quality. Near-duplicate entries that share
     vocabulary but differ in root cause are what actually exercises whether retrieval works.
+28. **A second "agent" in the roadmap is not automatically a second agent in the code.** RCA is named
+    an agent in the project's own plan but has no loop and no tools; it is architecturally identical
+    to a Phase 3 one-shot LLM call. Naming code for its actual shape, not for the vocabulary a plan
+    used to describe its role, is what keeps an architectural boundary (`llm/` vs `agents/`) meaning
+    something.
+29. **A safety-relevant decision must not move even when a new, more confident-sounding voice joins
+    the pipeline.** Escalation was already correctly decided before RCA existed. Adding RCA after
+    that decision, with a test proving a deliberately low-confidence RCA result cannot change it, is
+    what keeps a new source of narrative from quietly becoming a new way to override deterministic
+    judgement.
