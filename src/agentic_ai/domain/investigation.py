@@ -81,10 +81,17 @@ class Finding(BaseModel):
     correct - which is precisely why the two are separate models.
     """
 
+    id: UUID = Field(default_factory=uuid4)
+    """Lets a later synthesis step (RCA) cite exactly which findings a
+    conclusion rests on, rather than restating or re-deriving them. Added
+    when RCA actually needed it (Phase 7) rather than speculatively in
+    Phase 5, per supporting_evidence_ids having been deliberately deferred
+    there until something concrete required it."""
+
     statement: str
     model_assessed_confidence: float = Field(ge=0.0, le=1.0)
     # Deferred: supporting_evidence_ids linking each finding to specific
-    # Evidence. Needed for RCA, human review and evaluation; premature now.
+    # Evidence. Needed for human review and evaluation; still premature.
 
 
 class InvestigationResult(BaseModel):
