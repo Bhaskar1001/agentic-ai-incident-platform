@@ -3,10 +3,11 @@
 > Single source of truth for this project: what it is, why it exists, what has been built in each
 > phase, and the reasoning behind every significant decision.
 >
-> **Last updated:** 2026-10-07 · **Current phase:** Phase 5 complete — the full pipeline (assess →
-> investigate → route) runs end-to-end on three scenarios, including a healthy service, with
-> escalation decided by deterministic policy over raw evidence. The LLM layer now sits behind a
-> provider-agnostic client; OpenRouter is the default, Ollama remains available. Phase 6 (RAG) next.
+> **Last updated:** 2026-10-10 · **Current phase:** Phase 6 complete — the investigation agent can
+> optionally retrieve similar past incidents from a synthetic knowledge base via a
+> search_knowledge_base tool, backed by local sentence-transformer embeddings and in-memory cosine
+> similarity search. The three observability tools remain the only mandatory evidence floor; retrieval
+> is advisory, and the agent decides when consulting it is worthwhile. Phase 7 (multi-agent) next.
 
 ---
 
@@ -99,6 +100,8 @@ introduced only when a real problem justifies it, never for its own sake.
 | **OpenRouter (default) + Ollama (kept)** | Hosted, OpenAI-compatible API with free-tier models — chosen after Ollama's local disk footprint became impractical on the development machine. Sits behind `LLMClient`, an abstraction introduced at this point specifically because the project's own stated "provider-agnostic" intent (see below) had not actually been enforced in code until a second real provider existed to prove it against. | Staying Ollama-only — ruled out by disk space, not by design; the project otherwise has no objection to a local model and keeps Ollama working behind the same interface. |
 | **httpx** | Already a transitive dependency via `ollama`; used directly for the OpenRouter HTTP client rather than adding a second HTTP library. | `requests` — no reason to add a second dependency for the same job. |
 | **python-dotenv** | Loads `OPENROUTER_API_KEY` from a local, gitignored `.env` file rather than requiring it to be exported in every shell session. | Plain environment variables only — more portable across shells, but easy to forget to set and harder to keep consistent across a team. |
+| **sentence-transformers (`all-MiniLM-L6-v2`)** | Local embedding model for knowledge-base retrieval — free, no network dependency once cached, and small enough (~80MB) not to reintroduce the disk-space problem that moved the project off Ollama, which was about multi-GB LLM checkpoints specifically. | A hosted embedding API — rejected to avoid a second paid-API dependency beyond OpenRouter for a corpus this small. |
+| **numpy** | Brute-force cosine similarity over ~20 embedded documents. | A vector database (Chroma/pgvector) — rejected per the project's own "no infrastructure until a concrete problem demands it" principle; neither scale nor persistence-across-restarts is a real problem yet for a static ~20-document corpus. |
 | **LangGraph** | Explicit, inspectable **state** across steps; **cycles** (agent loops back to gather more evidence); **interrupts** for human-in-the-loop approval. | LangChain chains alone — fundamentally a linear pipeline; awkward for loops and stateful branching. Plain Python — would work, but we'd hand-roll state management, checkpointing, and interrupts. |
 | **pytest** | Standard, minimal ceremony. Dev-only dependency so it never ships to production. | — |
 | **`src/` layout** | Package is only importable if properly installed, so packaging bugs surface immediately instead of being masked by `sys.path` accidents. | Flat layout — "works on my machine" risk. |
@@ -1018,14 +1021,109 @@ both the assistant message and its matching tool-result message.
 monkeypatched `ollama.chat` on the module directly (`test_severity.py`, `test_investigation.py`) to
 instead inject a fake `LLMClient` or patch `get_client()` — a more direct seam that does not need to
 change again if a third provider is ever added.
+### Phase 6 — RAG: a knowledge base of past incidents ✅
+
+**Goal:** the investigation agent reasoned from raw evidence alone every single time, with no benefit
+from "we have seen this exact failure pattern before." RAG gives it access to a corpus of past
+incidents it can retrieve from and ground its reasoning in, without changing what kind of evidence
+the escalation policy trusts.
+
+**Built:**
+
+```
+src/agentic_ai/
+├── domain/knowledge.py           KnowledgeEntry, KnowledgeSearchResult
+└── tools/
+    ├── knowledge_corpus.py       18 synthetic past-incident records
+    ├── knowledge_retrieval.py    embed-once, in-memory cosine similarity search
+    └── search_tool.py            search_knowledge_base(), the agent-facing tool
+```
+
+**Key decisions:**
+
+- **In-memory, not a vector database.** The corpus is ~20 static Python objects; brute-force cosine
+  similarity over that many vectors costs microseconds. Argued against a real vector DB (Chroma /
+  pgvector) explicitly against this project's own stated principle — *"add complexity only when a
+  real problem demands it"* — since neither problem a vector database actually solves (a corpus too
+  large to hold in memory, or one that changes at runtime and needs persistence) exists here. Revisit
+  if either becomes true.
+- **Local embeddings (`sentence-transformers`, `all-MiniLM-L6-v2`), not a hosted embedding API.**
+  Keeps the corpus searchable with zero additional paid-API dependency beyond OpenRouter, and the
+  ~80MB model checkpoint is a non-issue on this machine (156GB free) — the disk-space constraint that
+  moved the project off Ollama was about multi-GB LLM checkpoints, not a blanket rule against any
+  local model.
+- **The embedding model loads lazily, on first search, not at import time.** Importing
+  `knowledge_retrieval` happens as a side effect of importing the tools package at all; paying a
+  ~70-second one-time model-load cost (confirmed by direct measurement) on every import, including
+  test collection, would have been a real cost for no benefit until retrieval is actually used.
+- **Retrieval matches on symptoms only, not on root_cause or resolution.**
+  `KnowledgeEntry.as_search_text()` embeds title + symptom_description exclusively. If the answer
+  text itself were embedded, a query that happened to share vocabulary with a *resolution* (e.g.
+  "restart the pod") could outrank an entry with a genuinely similar *symptom* but a differently-worded
+  fix. This mirrors the same discipline that kept `Evidence` and `Finding` separate in Phase 5:
+  observation and inference must not be allowed to contaminate each other.
+- **The corpus was deliberately written to contain near-duplicate pairs**, not just obviously distinct
+  entries, because a retrieval system tested only on easy cases proves nothing. RB-001 (local database
+  exhaustion) vs RB-002 (upstream, locally healthy) share surface vocabulary; RB-006 vs RB-007 are
+  both Kubernetes CrashLoopBackOff with different causes (bad config vs insufficient memory); RB-002
+  and RB-009 both read as "the problem is upstream" but differ in symptom (timeout/5xx vs HTTP 429).
+  Live-verified: the corpus and model correctly discriminate all of these when the query describes
+  the actual positive symptom.
+
+**A real finding about the embedding model, caught by a failing test rather than hidden.** An early
+version of the RB-001/RB-002 discrimination test phrased its query as a negation — *"our database is
+completely healthy"* — and it mis-ranked RB-001 (a database-themed entry) above RB-002, even though
+the query was specifically trying to rule the database **out**. Diagnosed directly rather than
+assumed: `all-MiniLM-L6-v2` is measurably weaker at negation than at topical/lexical matching —
+mentioning "database" at all, even to deny it, pulled database-themed entries up in the ranking.
+Rewriting the query to describe the actual positive symptom (timeouts calling an external dependency)
+rather than negating the alternative fixed it with a clear margin. Kept as a documented finding and a
+reusable principle for writing retrieval queries generally, not quietly tuned away.
+
+**The mandatory-vs-optional tool question, decided explicitly rather than defaulted.** The existing
+Phase 5.5 coverage-enforcement logic (`MIN_DISTINCT_TOOLS`, `should_continue`,
+`require_more_evidence_node`) computed "which required tools are still missing" as
+`set(INVESTIGATION_TOOLS) - used` — every *registered* tool was treated as mandatory. Adding
+`search_knowledge_base` to the registry naively would have forced the agent to consult past incidents
+on every single investigation, including ones with no relevant precedent, burning a step for no
+benefit. Introduced `REQUIRED_TOOLS` (the three observability tools only) as the actual floor the
+coverage logic enforces, leaving the knowledge-base tool registered, callable, and mentioned in the
+prompt as explicitly **optional** — the agent decides whether a precedent is worth checking. The
+registry itself was generalised at the same time: `dispatch_tool` previously assumed every tool took
+`service` + `scenario`; it now distinguishes scenario-aware tools (the three mock observability tools,
+which read whichever incident scenario is active) from the knowledge base (one real corpus,
+independent of any scenario) via an explicit `_SCENARIO_AWARE_TOOLS` set, rather than passing
+`scenario` to every tool uniformly and hoping it is ignored.
+
+**Live-verified end to end.** Across three live runs (one per scenario):
+- `connection_pool_exhaustion`: the agent called all three required tools, **then chose to call
+  `search_knowledge_base`** on its own judgement, retrieved RB-001 at 0.722 similarity (the correct,
+  directly matching runbook), and produced a correct diagnosis.
+- `upstream_dependency_failure` and `healthy`: the agent concluded confidently from the three
+  required tools alone, **without** calling the knowledge base — it judged the precedent lookup
+  unnecessary. This is the "optional, agent decides" design working as intended, not a gap: the tool
+  is available, not force-fed into every run.
+- One run on the pool-exhaustion scenario produced `model_assessed_confidence = 0.0` on every finding
+  despite a correct, well-evidenced diagnosis. Re-run immediately with identical inputs and it
+  produced sensible confidences (0.92) instead — consistent with the already-documented
+  "behavioural variance across runs" finding from Phase 5.5, not a defect introduced by this change.
+  Confirmed by direct comparison that the knowledge-base retrieval itself was correct and unchanged
+  across both runs.
+
+**142 tests passing** (up from 123): 17 new tests in `tests/test_knowledge.py` covering corpus
+integrity, the symptom/answer separation invariant, real-embedding retrieval quality on the
+deliberately-hard pairs, and the agent-facing tool's JSON contract and error handling; plus 2 tests in
+`test_investigation.py` split and extended to cover the generalised registry (one asserting the full
+4-tool schema set, one confirming the knowledge-base tool's schema has no `service` parameter).
 
 
 ---
 
 ## 5. Current State
 
-**Test suite: 123 passing** (43 escalation · 39 mock tools · 16 investigation · 11 incident ·
-10 workflow · 4 severity). Exactly one touches the live model; the rest are deterministic.
+**Test suite: 142 passing** (43 escalation · 39 mock tools · 18 investigation · 17 knowledge ·
+11 incident · 10 workflow · 4 severity). Exactly one touches the live LLM; the knowledge tests load
+a real local embedding model but no LLM; the rest are fully deterministic.
 
 ```
 src/agentic_ai/
@@ -1033,7 +1131,8 @@ src/agentic_ai/
 │   ├── incident.py          Incident, Severity, IncidentStatus, transition_to()
 │   ├── investigation.py     Evidence, Finding, TimelineEntry, InvestigationResult,
 │   │                        TerminationReason, TimelineEventType
-│   └── escalation.py        Deterministic escalation policy over raw evidence
+│   ├── escalation.py        Deterministic escalation policy over raw evidence
+│   └── knowledge.py         KnowledgeEntry, KnowledgeSearchResult
 ├── llm/
 │   ├── client.py            LLMClient protocol, ChatResponse, ToolCall, get_client()
 │   ├── severity.py          SeverityAssessment, assess_severity(), custom exceptions
@@ -1041,15 +1140,19 @@ src/agentic_ai/
 │       ├── ollama_provider.py       local model, synthesises a tool_call id
 │       └── openrouter_provider.py   hosted, OpenAI-compatible, default provider
 ├── tools/
-│   ├── mock_tools.py        get_mock_logs/metrics/pod_status(), MockService
-│   └── registry.py          build_tool_schemas(), dispatch_tool(), ToolNotFoundError
+│   ├── mock_tools.py          get_mock_logs/metrics/pod_status(), MockService
+│   ├── registry.py            build_tool_schemas(), dispatch_tool(), REQUIRED_TOOLS
+│   ├── knowledge_corpus.py    18 synthetic past-incident records
+│   ├── knowledge_retrieval.py embed-once, in-memory cosine similarity search
+│   └── search_tool.py         search_knowledge_base(), the agent-facing tool
 ├── agents/investigation.py  bounded ReAct subgraph, investigate(), coverage enforcement
 ├── workflows/incident.py    assess -> investigate -> route, handle_incident()
 └── api/                     (empty — later)
 ```
 
 **Dependencies:** `langgraph>=1.2.11` · `httpx>=0.28.1` · `python-dotenv>=1.2.4` ·
-`pydantic>=2.13.5` · `ollama>=0.6.2` (kept, no longer the default) · *dev:* `pytest>=9.1.1`
+`sentence-transformers` · `numpy` · `pydantic>=2.13.5` ·
+`ollama>=0.6.2` (kept, no longer the default) · *dev:* `pytest>=9.1.1`
 
 **LLM provider:** OpenRouter by default (`LLM_PROVIDER=openrouter` in `.env`, see `.env.example`),
 model `nvidia/nemotron-3-super-120b-a12b:free`. Ollama remains available via `LLM_PROVIDER=ollama`.
@@ -1074,6 +1177,8 @@ model `nvidia/nemotron-3-super-120b-a12b:free`. Ollama remains available via `LL
 | Model-assessed confidence calibration | Unknown | Ordering looks sensible; true calibration is a Phase 13 question |
 | Prompt robustness | Improved | Verified on three scenarios including a healthy service. A fourth (partial/ambiguous evidence) remains untested |
 | Behavioural variance across runs | Open | The same scenarios do not fail the same way twice. One green run proves little; this is the concrete case for Phase 13 golden tests |
+| Knowledge corpus is synthetic and static | Open | 18 hand-written runbooks, no real incident history, no mechanism to add entries without a code change. Fine for proving the retrieval mechanism; not a real knowledge base yet |
+| Embedding model weak at negation | Open | `all-MiniLM-L6-v2` mis-ranked a database-themed entry above the correct one when a test query negated "database" rather than describing the actual positive symptom. Noted as a property of this model size, not fixed - queries should describe what IS happening |
 | Escalation thresholds | Provisional | The numbers (5%, 90%, 2000ms, 10%) are reasonable defaults, not tuned against real incident data |
 | Model narrative misstates observed values | Open | Recurring, not a one-off. Across live runs it reported p95 as 5100ms (the fixture's p99; p95 is 2400), called a 12.5% error rate "within normal ranges" at 0.8 confidence, and called 34% "low". Routing is unaffected because escalation reads raw numbers, but the summary a human reads can be wrong, and `recommended_next_action` is model-authored. A Phase 13 evaluation target |
 | Free-tier model availability | Open | OpenRouter free models are shared across all users and can be rate-limited or withdrawn without notice (observed directly: the first model chosen hit a 429 within the same session it was picked). No retry/fallback logic exists yet; a sustained outage of the default model will surface as a 429 to the caller |
@@ -1090,7 +1195,7 @@ model `nvidia/nemotron-3-super-120b-a12b:free`. Ollama remains available via `LL
 | 3 | LLM foundation — structured output | ✅ |
 | 4 | LangGraph — state, nodes, routing | ✅ |
 | 5 | Investigation agent + mock tools | ✅ |
-| 6 | RAG — engineering knowledge retrieval | ⬜ |
+| 6 | RAG — engineering knowledge retrieval | ✅ |
 | 7 | Multi-agent — supervisor, RCA, remediation planner | ⬜ |
 | 8 | Memory — short-term, long-term, vector | ⬜ |
 | 9 | MCP & tool engineering | ⬜ |
@@ -1172,3 +1277,11 @@ Extracted from decisions actually made in this project, not aspirational:
 25. **A secret typed into the wrong file is compromised the moment it is typed, not the moment it is
     committed.** Catching a leak before `git commit` is real and worth doing, but it does not undo the
     exposure; rotate the credential regardless of whether it reached version control.
+26. **Not every registered capability is mandatory.** Generalising "all tools are required" to "all
+    registered tools are required" would have forced a knowledge-base lookup into every investigation,
+    including ones with no relevant precedent. A tool being available to the agent and a tool being
+    part of the evidence floor are different facts; conflating them costs a wasted step every time the
+    optional tool has nothing useful to contribute.
+27. **Test retrieval on the hard pairs, not the easy ones.** A corpus where every document is
+    trivially distinct proves nothing about ranking quality. Near-duplicate entries that share
+    vocabulary but differ in root cause are what actually exercises whether retrieval works.
