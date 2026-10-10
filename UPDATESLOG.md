@@ -8,8 +8,9 @@
 > consistency), produced as a single structured-output call rather than a second agent loop. The
 > investigation agent from Phase 5 (with the optional knowledge-base retrieval from Phase 6)
 > remains the only looping agent in the system; no Supervisor exists yet, since two steps in a fixed
-> sequence give it no real decision to make. Phase 7 continuation (more agents / a Supervisor) or
-> Phase 8 (memory) next.
+> sequence give it no real decision to make. OpenRouter's free-tier rate limit, confirmed twice, is
+> now understood (a 50-request/day account-wide quota) and surfaced with a clear error rather than a
+> generic one. A Remediation Planner is next.
 
 ---
 
@@ -1223,17 +1224,88 @@ prompt-section rendering, citation validation including the retry-then-raise pat
 the monitor path, skipped with no findings, skipped when investigation itself failed, a failure inside
 RCA does not block escalation, unexpected errors still propagate, and routing is provably unaffected
 by RCA's content).
+### Hardening — understanding and surfacing the OpenRouter rate limit properly ✅
+
+**Goal:** the free-tier 429 had been hit twice (Phase 5.6, Phase 7) and left as an open known issue
+each time - "no retry/fallback logic exists yet." Before writing a retry, the actual failure needed
+to be understood rather than assumed.
+
+**What the 429 actually is, confirmed by reading the real response rather than guessing.** The
+response headers and body on a live 429 were inspected directly:
+
+```
+x-ratelimit-limit: 50
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 1791676800000   (decodes to the next UTC midnight)
+
+body: {"error": {"message": "Rate limit exceeded: free-models-per-day...",
+                  "metadata": {"limit_source": "openrouter_free_tier_daily",
+                               "remedy_hint": "Wait for the daily reset..."}}}
+```
+
+This is a **50-request-per-day account-wide quota**, shared across every free model under one API
+key - confirmed directly by hitting three different free models back to back and seeing the same
+`remaining: 0` on all three. It is not a per-minute throttle. This finding changes what "fix the rate
+limit" has to mean: a short exponential backoff (seconds to minutes) would be the wrong tool entirely
+here - it would fail silently for up to several hours rather than surface the real problem, and worse,
+if it were ever applied inside the investigation agent's own tool-calling loop it could make a single
+investigation hang for a long time with no useful signal about why.
+
+**Decided explicitly against the two other options.** Buying $10 of OpenRouter credits (which the
+error message itself offers, raising the limit from 50 to 1000/day) was considered and rejected -
+it solves the symptom with money rather than engineering, and reopens the "no budget for paid APIs"
+constraint this project committed to from Phase 3 onward. A naive retry-with-backoff was also
+rejected for the reason above. The chosen fix: **detect this specific failure and fail fast with a
+message that actually explains it**, rather than retry blindly or let a generic HTTP error obscure
+what happened.
+
+**Built:**
+
+- `LLMRateLimitError` added to `llm/client.py`, at the shared abstraction level rather than inside
+  the OpenRouter provider specifically - any provider could in principle have a quota-shaped failure,
+  even though Ollama (no external quota) does not today. Carries an optional `retry_after` string, so
+  a caller can see what "come back later" concretely means here rather than guessing from a bare HTTP
+  error.
+- `OpenRouterClient.complete()` now inspects a 429 response body before raising anything.
+  `limit_source == "openrouter_free_tier_daily"` produces a message stating the quota size, the exact
+  reset time (decoded from the millisecond timestamp OpenRouter returns), and the provider's own
+  remedy hint. Any other 429 shape still raises `LLMRateLimitError` - distinguishable from an
+  arbitrary HTTP failure - but does not fabricate a reset time it was never actually given. A
+  malformed or unparseable error body is handled without crashing while handling the 429, which would
+  otherwise replace a clear rate-limit signal with a confusing one.
+- Non-429 errors (5xx, etc.) are deliberately left to raise their ordinary `httpx.HTTPStatusError` -
+  reclassifying every HTTP failure as a rate limit would hide genuine infrastructure problems behind
+  the wrong exception type.
+
+**Verified against the real, currently-exhausted quota, not only against mocks.** The fix was tested
+live while the account's daily quota was genuinely at 0 remaining: `OpenRouterClient.complete()`
+raised `LLMRateLimitError` with the message *"OpenRouter's free-model daily quota (50 requests/day)
+is exhausted. Resets at 2026-10-11T00:00:00+00:00..."* - the real failure mode, not a simulated one.
+6 new deterministic tests in `tests/test_openrouter_provider.py` (using `monkeypatch` on `httpx.post`,
+never the real network, since real network calls are exactly the scarce resource under test) cover
+the daily-quota shape, a non-daily 429 shape, a malformed error body, a genuine 5xx remaining
+unaffected, and a normal success response remaining unaffected by the new 429-handling branch.
+
+**No workflow-level change was made.** `assess_severity_node` has no try/except around
+`assess_severity()` at all - an `LLMRateLimitError` there crashes the workflow immediately, which is
+correct by this project's own established principle: a real infrastructure failure should surface
+clearly, not be silently absorbed. The value of this fix is entirely in *what* crashes the workflow
+now - a message naming the exact cause and the exact reset time, instead of a generic
+`HTTPStatusError` that looked identical whether the problem would resolve in five seconds or seven
+hours.
 
 
 ---
 
 ## 5. Current State
 
-**Test suite: 161 tests** (43 escalation · 39 mock tools · 18 investigation · 17 knowledge ·
-12 rca · 17 workflow · 11 incident · 4 severity). Exactly one touches the live LLM directly
-(`test_assess_severity_live`); the knowledge tests load a real local embedding model but no LLM; the
-rest are fully deterministic. 160 passed as of this writing - the live test failed on a transient
-OpenRouter free-tier 429, not a code defect (see Known Issues).
+**Test suite: 167 tests** (43 escalation · 39 mock tools · 18 investigation · 17 knowledge ·
+12 rca · 17 workflow · 11 incident · 6 openrouter provider · 4 severity). Exactly one touches the
+live LLM directly (`test_assess_severity_live`); the knowledge tests load a real local embedding
+model but no LLM; the OpenRouter provider tests mock the HTTP layer deliberately, to test 429 handling
+without consuming real quota; the rest are fully deterministic. 166 passed as of this writing - the
+live test fails once the daily quota is exhausted, now with a clear `LLMRateLimitError` instead of a
+generic one (see Known Issues).
 
 ```
 src/agentic_ai/
@@ -1246,7 +1318,8 @@ src/agentic_ai/
 │   └── rca.py               RootCauseAnalysis, AlternativeHypothesis,
 │                            KnowledgeBaseConsistency
 ├── llm/
-│   ├── client.py            LLMClient protocol, ChatResponse, ToolCall, get_client()
+│   ├── client.py            LLMClient protocol, ChatResponse, ToolCall, get_client(),
+│   │                        LLMRateLimitError
 │   ├── severity.py          SeverityAssessment, assess_severity(), custom exceptions
 │   ├── rca.py                analyze_root_cause() - one call, no tools, no loop
 │   └── providers/
@@ -1294,8 +1367,7 @@ model `nvidia/nemotron-3-super-120b-a12b:free`. Ollama remains available via `LL
 | Embedding model weak at negation | Open | `all-MiniLM-L6-v2` mis-ranked a database-themed entry above the correct one when a test query negated "database" rather than describing the actual positive symptom. Noted as a property of this model size, not fixed - queries should describe what IS happening |
 | Escalation thresholds | Provisional | The numbers (5%, 90%, 2000ms, 10%) are reasonable defaults, not tuned against real incident data |
 | Model narrative misstates observed values | Open | Recurring, not a one-off. Across live runs it reported p95 as 5100ms (the fixture's p99; p95 is 2400), called a 12.5% error rate "within normal ranges" at 0.8 confidence, and called 34% "low". Routing is unaffected because escalation reads raw numbers, but the summary a human reads can be wrong, and `recommended_next_action` is model-authored. A Phase 13 evaluation target |
-| Free-tier model availability | Open | OpenRouter free models are shared across all users and can be rate-limited or withdrawn without notice (observed directly: the first model chosen hit a 429 within the same session it was picked). No retry/fallback logic exists yet; a sustained outage of the default model will surface as a 429 to the caller |
-| Free-tier rate limit recurred in Phase 7 | Open | Confirmed again, not just a one-off: adding an RCA call per escalating incident increases free-pool consumption, and a live verification run hit 429 on retry within the same session. No retry/backoff exists; this is now two independent confirmations of the same documented risk, worth addressing before relying on live runs for anything time-sensitive |
+| Free-tier daily quota (50 requests/account/day) | Resolved, still a real constraint | Confirmed to be an account-wide daily cap, not per-model throttling, by reading the actual 429 response (`limit_source: openrouter_free_tier_daily`, `x-ratelimit-reset`). `LLMRateLimitError` now surfaces this clearly with the exact reset time instead of a generic HTTP error - the *quota itself* is unchanged and will still block live testing once exhausted each day; this closes "the failure is confusing," not "the limit exists" |
 | Exposed API key | Resolved, flagged | A key was briefly typed into `.env.example` (the committed template) instead of `.env`. Caught before any commit or push, corrected immediately, but the key reached the conversation and should be rotated — left as the user's explicit choice, not yet done as of this writing |
 
 ---
@@ -1409,3 +1481,8 @@ Extracted from decisions actually made in this project, not aspirational:
     that decision, with a test proving a deliberately low-confidence RCA result cannot change it, is
     what keeps a new source of narrative from quietly becoming a new way to override deterministic
     judgement.
+30. **Read the actual error before designing the fix.** "Rate limit exceeded" sounds like a problem a
+    short retry solves. The real response body said `free-models-per-day` and an exact UTC reset
+    timestamp - a 50-requests-per-day account quota, not per-minute throttling. A backoff-and-retry
+    built on the assumed version would have failed silently for hours instead of surfacing the real
+    constraint.
