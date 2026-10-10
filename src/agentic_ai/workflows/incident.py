@@ -2,13 +2,16 @@
 
 Orchestrates the pieces into one flow::
 
-    assess severity -> investigate -> route on severity
-                                        |- HIGH/CRITICAL -> escalate
-                                        `- LOW/MEDIUM    -> monitor
+    assess severity -> investigate -> route on evidence
+                                        |- urgent -> root cause analysis -> escalate
+                                        `- normal -> monitor
 
 Every incident is investigated before routing, so an escalation always carries
-evidence with it. Deciding what to *do* about an incident is a separate concern
-from finding out what is wrong with it.
+evidence with it. Root cause analysis runs only on the escalation path: an
+incident routed to monitor was not an incident, and there is no root cause to
+explain. Routing itself never consults RCA's output - escalation is decided
+from raw evidence before RCA exists, the same principle that keeps the
+escalation policy reading tool output rather than an LLM's narrative about it.
 """
 
 from typing import Literal, TypedDict
@@ -19,6 +22,8 @@ from agentic_ai.agents.investigation import InvestigationError, investigate
 from agentic_ai.domain.escalation import evaluate
 from agentic_ai.domain.incident import Severity
 from agentic_ai.domain.investigation import InvestigationResult
+from agentic_ai.domain.rca import RootCauseAnalysis
+from agentic_ai.llm.rca import RootCauseAnalysisError, analyze_root_cause
 from agentic_ai.llm.severity import SeverityAssessment, assess_severity
 from agentic_ai.tools.mock_tools import DEFAULT_SCENARIO, Scenario
 
@@ -39,6 +44,8 @@ class IncidentWorkflowState(TypedDict):
     severity_assessment: SeverityAssessment | None
     investigation: InvestigationResult | None
     investigation_error: str | None
+    root_cause_analysis: RootCauseAnalysis | None
+    root_cause_analysis_error: str | None
     next_step: str | None
 
 
@@ -104,8 +111,32 @@ def route_by_severity(
     return "normal"
 
 
+def analyze_root_cause_node(state: IncidentWorkflowState) -> dict[str, object]:
+    """Synthesize a root cause analysis for an escalating incident.
+
+    Only reached on the escalation path - a "normal" incident was not an
+    incident, and there is nothing here to explain. An investigation that
+    never completed has no findings worth synthesizing either, so this is
+    skipped rather than asked to produce an analysis from nothing.
+
+    A failure here must not block escalation: a human is already being
+    paged, and an unexplained incident with no RCA is still better handed to
+    a human than silently dropped.
+    """
+    investigation = state["investigation"]
+    if investigation is None or not investigation.findings:
+        return {"root_cause_analysis": None, "root_cause_analysis_error": None}
+
+    try:
+        analysis = analyze_root_cause(investigation)
+    except RootCauseAnalysisError as exc:
+        return {"root_cause_analysis": None, "root_cause_analysis_error": str(exc)}
+
+    return {"root_cause_analysis": analysis, "root_cause_analysis_error": None}
+
+
 def escalate_node(state: IncidentWorkflowState) -> dict[str, str]:
-    """Hand off to a human, with whatever evidence was gathered."""
+    """Hand off to a human, with whatever evidence and analysis were gathered."""
     return {"next_step": "escalate"}
 
 
@@ -119,6 +150,7 @@ def build_incident_workflow():
 
     builder.add_node("assess_severity", assess_severity_node)
     builder.add_node("investigate", investigate_node)
+    builder.add_node("analyze_root_cause", analyze_root_cause_node)
     builder.add_node("escalate", escalate_node)
     builder.add_node("monitor", monitor_node)
 
@@ -129,11 +161,12 @@ def build_incident_workflow():
         "investigate",
         route_by_severity,
         path_map={
-            "urgent": "escalate",
+            "urgent": "analyze_root_cause",
             "normal": "monitor",
         },
     )
 
+    builder.add_edge("analyze_root_cause", "escalate")
     builder.add_edge("escalate", END)
     builder.add_edge("monitor", END)
 
@@ -155,6 +188,8 @@ def handle_incident(
             "severity_assessment": None,
             "investigation": None,
             "investigation_error": None,
+            "root_cause_analysis": None,
+            "root_cause_analysis_error": None,
             "next_step": None,
         }
     )

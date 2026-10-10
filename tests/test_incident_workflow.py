@@ -4,9 +4,12 @@ from agentic_ai.agents.investigation import InvalidConclusionError
 from agentic_ai.domain.incident import Severity
 from agentic_ai.domain.investigation import (
     Evidence,
+    Finding,
     InvestigationResult,
     TerminationReason,
 )
+from agentic_ai.domain.rca import KnowledgeBaseConsistency, RootCauseAnalysis
+from agentic_ai.llm.rca import InvalidRootCauseAnalysisError
 from agentic_ai.llm.severity import SeverityAssessment
 from agentic_ai.tools.mock_tools import (
     Scenario,
@@ -40,6 +43,7 @@ def _evidence(scenario: Scenario) -> list[Evidence]:
 def _result(
     termination: TerminationReason = TerminationReason.COMPLETED,
     scenario: Scenario = Scenario.HEALTHY,
+    findings: list[Finding] | None = None,
 ) -> InvestigationResult:
     return InvestigationResult(
         summary="Investigation summary.",
@@ -47,6 +51,22 @@ def _result(
         recommended_next_action="No action required.",
         termination_reason=termination,
         evidence=_evidence(scenario),
+        findings=findings or [],
+    )
+
+
+def _finding() -> Finding:
+    return Finding(
+        statement="Connection pool utilisation is 100%.",
+        model_assessed_confidence=0.9,
+    )
+
+
+def _analysis() -> RootCauseAnalysis:
+    return RootCauseAnalysis(
+        root_cause="Database connection pool exhaustion.",
+        root_cause_confidence=0.9,
+        knowledge_base_consistency=KnowledgeBaseConsistency.NO_RELEVANT_PRECEDENT,
     )
 
 
@@ -54,7 +74,13 @@ def _result(
 def stub_dependencies(monkeypatch):
     """Replace the LLM-backed steps with deterministic stubs."""
 
-    def _apply(severity: Severity, investigation=None, error: Exception | None = None):
+    def _apply(
+        severity: Severity,
+        investigation=None,
+        error: Exception | None = None,
+        rca_result=None,
+        rca_error: Exception | None = None,
+    ):
         monkeypatch.setattr(
             workflow_module,
             "assess_severity",
@@ -67,6 +93,15 @@ def stub_dependencies(monkeypatch):
             return investigation if investigation is not None else _result()
 
         monkeypatch.setattr(workflow_module, "investigate", fake_investigate)
+
+        def fake_analyze_root_cause(result):
+            if rca_error is not None:
+                raise rca_error
+            return rca_result if rca_result is not None else _analysis()
+
+        monkeypatch.setattr(
+            workflow_module, "analyze_root_cause", fake_analyze_root_cause
+        )
 
     return _apply
 
@@ -197,3 +232,112 @@ def test_no_evidence_escalates(stub_dependencies) -> None:
     )
 
     assert handle_incident("Something odd")["next_step"] == "escalate"
+
+
+# --- root cause analysis integration -------------------------------------
+
+
+def test_rca_runs_on_the_escalation_path_when_findings_exist(
+    stub_dependencies,
+) -> None:
+    stub_dependencies(
+        Severity.CRITICAL,
+        investigation=_result(findings=[_finding()]),
+    )
+
+    state = handle_incident("Payment service is down")
+
+    assert state["next_step"] == "escalate"
+    assert state["root_cause_analysis"] is not None
+    assert state["root_cause_analysis"].root_cause == "Database connection pool exhaustion."
+    assert state["root_cause_analysis_error"] is None
+
+
+def test_rca_does_not_run_on_the_monitor_path(stub_dependencies) -> None:
+    stub_dependencies(
+        Severity.LOW,
+        investigation=_result(findings=[_finding()]),
+    )
+
+    state = handle_incident("Minor logging delay")
+
+    assert state["next_step"] == "monitor"
+    assert state["root_cause_analysis"] is None
+
+
+def test_rca_is_skipped_when_investigation_produced_no_findings(
+    stub_dependencies,
+) -> None:
+    """Nothing to synthesize - RCA must not be asked to invent a conclusion."""
+    stub_dependencies(
+        Severity.CRITICAL,
+        investigation=_result(findings=[]),
+    )
+
+    state = handle_incident("Payment service is down")
+
+    assert state["next_step"] == "escalate"
+    assert state["root_cause_analysis"] is None
+    assert state["root_cause_analysis_error"] is None
+
+
+def test_rca_is_skipped_when_investigation_itself_failed(stub_dependencies) -> None:
+    stub_dependencies(
+        Severity.CRITICAL,
+        error=InvalidConclusionError("model produced nothing usable"),
+    )
+
+    state = handle_incident("Payment service is down")
+
+    assert state["next_step"] == "escalate"
+    assert state["investigation"] is None
+    assert state["root_cause_analysis"] is None
+
+
+def test_rca_failure_does_not_block_escalation(stub_dependencies) -> None:
+    """A human is already being paged; a missing RCA should not stop that."""
+    stub_dependencies(
+        Severity.CRITICAL,
+        investigation=_result(findings=[_finding()]),
+        rca_error=InvalidRootCauseAnalysisError("model could not produce a valid analysis"),
+    )
+
+    state = handle_incident("Payment service is down")
+
+    assert state["next_step"] == "escalate"
+    assert state["root_cause_analysis"] is None
+    assert "could not produce" in state["root_cause_analysis_error"]
+
+
+def test_unexpected_rca_errors_are_not_swallowed(stub_dependencies) -> None:
+    stub_dependencies(
+        Severity.CRITICAL,
+        investigation=_result(findings=[_finding()]),
+        rca_error=RuntimeError("connection refused"),
+    )
+
+    with pytest.raises(RuntimeError, match="connection refused"):
+        handle_incident("Payment service is down")
+
+
+def test_routing_is_unaffected_by_rca_regardless_of_its_content(
+    stub_dependencies,
+) -> None:
+    """Routing is decided before RCA runs - this is enforced by graph order,
+    not by RCA's content, but a passing test here is a regression guard if
+    that ever changes.
+    """
+    low_confidence_analysis = RootCauseAnalysis(
+        root_cause="Unclear.",
+        root_cause_confidence=0.05,
+        knowledge_base_consistency=KnowledgeBaseConsistency.NO_RELEVANT_PRECEDENT,
+    )
+    stub_dependencies(
+        Severity.CRITICAL,
+        investigation=_result(findings=[_finding()]),
+        rca_result=low_confidence_analysis,
+    )
+
+    # Severity alone already routes this to escalate; a low-confidence RCA
+    # conclusion must not change that, since RCA runs strictly after routing.
+    assert handle_incident("Payment service is down")["next_step"] == "escalate"
