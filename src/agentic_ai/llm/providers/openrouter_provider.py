@@ -21,7 +21,12 @@ import os
 import httpx
 from dotenv import load_dotenv
 
-from agentic_ai.llm.client import ChatResponse, LLMConfigurationError, ToolCall
+from agentic_ai.llm.client import (
+    ChatResponse,
+    LLMConfigurationError,
+    LLMRateLimitError,
+    ToolCall,
+)
 
 load_dotenv()
 
@@ -80,6 +85,10 @@ class OpenRouterClient:
             json=payload,
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
+
+        if response.status_code == 429:
+            raise _rate_limit_error(response)
+
         response.raise_for_status()
         data = response.json()
 
@@ -97,3 +106,43 @@ class OpenRouterClient:
         ]
 
         return ChatResponse(content=message.get("content"), tool_calls=tool_calls)
+
+
+def _rate_limit_error(response: httpx.Response) -> LLMRateLimitError:
+    """Build a clear error from a 429, distinguishing OpenRouter's daily
+    free-model quota from any other rate limiting, since the two call for
+    completely different responses (wait until tomorrow vs. a short retry).
+    """
+    try:
+        body = response.json()
+        error = body.get("error", {})
+        metadata = error.get("metadata", {})
+    except (json.JSONDecodeError, AttributeError):
+        error, metadata = {}, {}
+
+    limit_source = metadata.get("limit_source", "")
+    reset_ms = metadata.get("headers", {}).get("X-RateLimit-Reset")
+    remedy = metadata.get("remedy_hint", "")
+
+    if limit_source == "openrouter_free_tier_daily":
+        reset_note = ""
+        if reset_ms:
+            import datetime
+
+            reset_time = datetime.datetime.fromtimestamp(
+                int(reset_ms) / 1000, tz=datetime.timezone.utc
+            )
+            reset_note = f" Resets at {reset_time.isoformat()}."
+
+        return LLMRateLimitError(
+            "OpenRouter's free-model daily quota (50 requests/day) is "
+            f"exhausted.{reset_note} {remedy}".strip(),
+            retry_after=reset_note.strip() or None,
+        )
+
+    # A rate limit that is not the known daily cap - still surfaced as a
+    # distinct type so callers can tell "LLM refused due to volume" apart
+    # from an arbitrary HTTP failure, even though this codebase does not
+    # yet know how to distinguish a case worth a short automatic retry.
+    message = error.get("message") or "OpenRouter rate limit exceeded."
+    return LLMRateLimitError(message)

@@ -80,6 +80,23 @@ class LLMConfigurationError(Exception):
     """Raised when the configured provider is missing required setup."""
 
 
+class LLMRateLimitError(Exception):
+    """Raised when a provider refuses a request due to a rate or quota limit.
+
+    Deliberately not retried automatically anywhere in this codebase. The
+    case that motivated this - OpenRouter's free-model daily quota - resets
+    once every 24 hours; a short backoff-and-retry would fail silently for
+    up to that long rather than surface the real problem. ``retry_after``
+    carries whatever the provider reported about when the limit clears, so a
+    caller can decide what "come back later" actually means here, rather
+    than guessing from a generic HTTP error.
+    """
+
+    def __init__(self, message: str, *, retry_after: str | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 def get_client() -> LLMClient:
     """Build the configured provider from the environment.
 
