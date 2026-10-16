@@ -1277,6 +1277,35 @@ Phase 10 approval flow. Memory is never pruned. Dedup is exact-match only.
 
 ---
 
+### Phase 9 — MCP server: the tools behind a protocol boundary ✅
+
+**Built:** `mcp_server/server.py`, an MCP server (stdio) exposing the four investigation tools,
+runnable as `agentic-ai-mcp` or `python -m agentic_ai.mcp_server.server`. New dependency: `mcp`
+(installed 2.3.0, a major version past what I knew; the high-level class is `MCPServer`, not
+`FastMCP`, and `mcp_types` is a separate package).
+
+**Registry stays the single source of truth.** Every call goes through `registry.dispatch_tool`,
+so a tool behaves identically in-process and over MCP, and descriptions are reused verbatim.
+Honest wrinkle: the SDK derives input schemas from function signatures, so the four MCP-facing
+signatures are written by hand. A test compares advertised names, descriptions, properties,
+required fields and allowed services against `build_tool_schemas()` so drift fails loudly instead
+of silently. (A single-value `Literal` is advertised as `const`, not `enum`; the test accepts both.)
+
+**Boundaries, both tested:**
+- **The client cannot choose the scenario.** It is fixed at server start (`AGENTIC_MCP_SCENARIO`);
+  a `scenario` argument from a client is ignored.
+- **Read-only.** Only the investigation tools are exposed, annotated `readOnlyHint`. Remediation is
+  deliberately not reachable over MCP until Phase 10 guardrails exist.
+
+**Verified:** 8 tests over the SDK's in-memory transport, plus one manual run over real stdio from
+a subprocess. **198 tests** total.
+
+**Not done:** the investigation agent does not consume tools over MCP; it still calls the registry
+directly. That needs a tool-provider seam in `agents/investigation.py` and is the natural follow-up.
+No auth or HTTP transport: stdio only, local trust.
+
+---
+
 ### Hardening — understanding and surfacing the OpenRouter rate limit properly ✅
 
 **Goal:** the free-tier 429 had been hit twice (Phase 5.6, Phase 7) and left as an open known issue
@@ -1437,7 +1466,7 @@ model `nvidia/nemotron-3-super-120b-a12b:free`. Ollama remains available via `LL
 | 6 | RAG — engineering knowledge retrieval | ✅ |
 | 7 | Multi-agent — RCA and remediation planner done; supervisor deferred (no routing choice yet) | ✅ |
 | 8 | Memory — long-term done (file-backed, unverified-by-default); vector store deferred | ✅ |
-| 9 | MCP & tool engineering | ⬜ |
+| 9 | MCP & tool engineering — server done; agent-side MCP client deferred | ✅ |
 | 10 | Guardrails — risk tiers, approval gates | ⬜ |
 | 11 | Remediation (mock first) | ⬜ |
 | 12 | Verification loop | ⬜ |
