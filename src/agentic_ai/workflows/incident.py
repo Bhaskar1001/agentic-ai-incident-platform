@@ -4,7 +4,7 @@ Orchestrates the pieces into one flow::
 
     assess severity -> investigate -> route on evidence
                                         |- urgent -> root cause analysis
-                                        |            -> remediation plan -> remember -> escalate
+                                        |            -> remediation plan -> guardrails -> remember -> escalate
                                         `- normal -> monitor
 
 Every incident is investigated before routing, so an escalation always carries
@@ -22,6 +22,7 @@ from langgraph.graph import END, START, StateGraph
 
 from agentic_ai.agents.investigation import InvestigationError, investigate
 from agentic_ai.domain.escalation import evaluate
+from agentic_ai.domain.guardrails import GuardedPlan, guard_plan
 from agentic_ai.domain.incident import Severity
 from agentic_ai.domain.investigation import InvestigationResult
 from agentic_ai.domain.knowledge import KnowledgeEntry
@@ -54,6 +55,7 @@ class IncidentWorkflowState(TypedDict):
     root_cause_analysis_error: str | None
     remediation_plan: RemediationPlan | None
     remediation_plan_error: str | None
+    guarded_plan: GuardedPlan | None
     memory_recorded: bool
     next_step: str | None
 
@@ -163,6 +165,30 @@ def plan_remediation_node(state: IncidentWorkflowState) -> dict[str, object]:
     return {"remediation_plan": plan, "remediation_plan_error": None}
 
 
+def apply_guardrails_node(state: IncidentWorkflowState) -> dict[str, GuardedPlan | None]:
+    """Judge every proposed step against the deterministic guardrail policy.
+
+    Pure code, so no failure handling: it reads the plan, the RCA and the
+    services the investigation actually examined, and nothing here executes.
+    """
+    plan = state["remediation_plan"]
+    analysis = state["root_cause_analysis"]
+    if plan is None or analysis is None:
+        return {"guarded_plan": None}
+
+    investigation = state["investigation"]
+    investigated = (
+        {
+            item.tool_arguments["service"]
+            for item in investigation.evidence
+            if "service" in item.tool_arguments
+        }
+        if investigation
+        else set()
+    )
+    return {"guarded_plan": guard_plan(plan, analysis, investigated)}
+
+
 def remember_incident_node(state: IncidentWorkflowState) -> dict[str, bool]:
     """Record the analysed incident in long-term memory, flagged as learned.
 
@@ -216,6 +242,7 @@ def build_incident_workflow():
     builder.add_node("investigate", investigate_node)
     builder.add_node("analyze_root_cause", analyze_root_cause_node)
     builder.add_node("plan_remediation", plan_remediation_node)
+    builder.add_node("apply_guardrails", apply_guardrails_node)
     builder.add_node("remember_incident", remember_incident_node)
     builder.add_node("escalate", escalate_node)
     builder.add_node("monitor", monitor_node)
@@ -233,7 +260,8 @@ def build_incident_workflow():
     )
 
     builder.add_edge("analyze_root_cause", "plan_remediation")
-    builder.add_edge("plan_remediation", "remember_incident")
+    builder.add_edge("plan_remediation", "apply_guardrails")
+    builder.add_edge("apply_guardrails", "remember_incident")
     builder.add_edge("remember_incident", "escalate")
     builder.add_edge("escalate", END)
     builder.add_edge("monitor", END)
@@ -260,6 +288,7 @@ def handle_incident(
             "root_cause_analysis_error": None,
             "remediation_plan": None,
             "remediation_plan_error": None,
+            "guarded_plan": None,
             "memory_recorded": False,
             "next_step": None,
         }

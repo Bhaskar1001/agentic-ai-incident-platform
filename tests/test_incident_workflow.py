@@ -472,3 +472,29 @@ def test_memory_write_failure_does_not_block_escalation(
 
     assert state["next_step"] == "escalate"
     assert state["memory_recorded"] is False
+
+
+# --- guardrails integration ----------------------------------------------
+
+
+def test_guardrails_judge_the_plan_on_the_escalation_path(stub_dependencies) -> None:
+    from agentic_ai.domain.guardrails import Disposition
+
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[_finding()]))
+
+    state = handle_incident("Payment service is down")
+
+    (guarded,) = state["guarded_plan"].steps
+    # increase_connection_pool is MEDIUM; payment was examined, so it passes.
+    assert guarded.disposition == Disposition.ALLOWED
+    assert state["next_step"] == "escalate"
+
+
+def test_guardrails_do_not_run_without_a_plan(stub_dependencies) -> None:
+    stub_dependencies(
+        Severity.CRITICAL,
+        investigation=_result(findings=[_finding()]),
+        plan_error=InvalidRemediationPlanError("no valid plan"),
+    )
+
+    assert handle_incident("Payment service is down")["guarded_plan"] is None

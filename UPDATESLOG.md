@@ -1306,6 +1306,37 @@ No auth or HTTP transport: stdio only, local trust.
 
 ---
 
+### Phase 10 — Guardrails: risk tiers and approval gates ✅
+
+**Built:** `domain/guardrails.py` (pure, no LLM or framework imports), an `apply_guardrails` node
+between `plan_remediation` and `remember_incident`, and `guarded_plan` in workflow state.
+
+**Policy:** LOW is allowed. MEDIUM is allowed only if it passes validation (the target service must
+have been examined during the investigation), otherwise it needs approval. HIGH needs a named human
+approval. CRITICAL is blocked and cannot be approved. Nothing is executed; `GuardedStep.may_execute`
+is the check a Phase 11 executor must make.
+
+**One asymmetry carries the design: weak signals raise risk, strong ones never lower it.** An RCA
+confidence below 0.6, or a knowledge-base precedent that contradicts the root cause, bumps each
+step up one tier. A confident RCA earns no discount, because confidence is model-authored narrative.
+This is what makes CRITICAL reachable: a HIGH step such as `failover` on a weak analysis is blocked
+outright, and a test pins that no analysis, however confident, lowers any tier.
+
+**Approval gate:** `GuardedPlan.approve()/reject()` are immutable (they return a new plan). They
+require a named approver, only act on a step that is pending, refuse a blocked step, and refuse a
+second decision on the same step.
+
+**Tests:** 19 in `test_guardrails.py` plus 2 workflow integration. **217 tests** total.
+
+**Not done, and worth knowing:**
+- Nothing yet *calls* `approve()`. There is no UI, API or persisted pending-approval queue, so
+  approvals exist as a domain mechanism only. The `api/` package is still empty.
+- Approver identity is a free-text string, not authenticated.
+- The 0.6 threshold and the one-tier bump are provisional, untuned, like the escalation thresholds.
+- Promoting a `learned` memory entry to `curated` still has no path; it should reuse this gate.
+
+---
+
 ### Hardening — understanding and surfacing the OpenRouter rate limit properly ✅
 
 **Goal:** the free-tier 429 had been hit twice (Phase 5.6, Phase 7) and left as an open known issue
@@ -1467,7 +1498,7 @@ model `nvidia/nemotron-3-super-120b-a12b:free`. Ollama remains available via `LL
 | 7 | Multi-agent — RCA and remediation planner done; supervisor deferred (no routing choice yet) | ✅ |
 | 8 | Memory — long-term done (file-backed, unverified-by-default); vector store deferred | ✅ |
 | 9 | MCP & tool engineering — server done; agent-side MCP client deferred | ✅ |
-| 10 | Guardrails — risk tiers, approval gates | ⬜ |
+| 10 | Guardrails — risk tiers, approval gates (domain mechanism; no approval surface yet) | ✅ |
 | 11 | Remediation (mock first) | ⬜ |
 | 12 | Verification loop | ⬜ |
 | 13 | Evaluation — golden cases, regression | ⬜ |
