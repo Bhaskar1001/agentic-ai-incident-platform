@@ -26,7 +26,8 @@ def search_knowledge_base(query: str, top_k: int = DEFAULT_TOP_K) -> str:
     before. Returns the most similar past incidents, each with its
     previously-identified root cause and resolution - treat these as
     informed hypotheses to confirm against the actual evidence, not as a
-    confirmed diagnosis for the current incident.
+    confirmed diagnosis for the current incident. Entries with source
+    "learned" come from earlier automated analyses and are unverified.
 
     Args:
         query: A description of the current symptoms, written the way an
@@ -60,6 +61,7 @@ def search_knowledge_base(query: str, top_k: int = DEFAULT_TOP_K) -> str:
                     "root_cause": result.entry.root_cause,
                     "resolution": result.entry.resolution,
                     "tags": result.entry.tags,
+                    "source": result.entry.source,
                     "similarity": round(result.similarity, 3),
                 }
                 for result in results

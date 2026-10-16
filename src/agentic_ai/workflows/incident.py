@@ -3,7 +3,8 @@
 Orchestrates the pieces into one flow::
 
     assess severity -> investigate -> route on evidence
-                                        |- urgent -> root cause analysis -> escalate
+                                        |- urgent -> root cause analysis
+                                        |            -> remediation plan -> remember -> escalate
                                         `- normal -> monitor
 
 Every incident is investigated before routing, so an escalation always carries
@@ -15,6 +16,7 @@ escalation policy reading tool output rather than an LLM's narrative about it.
 """
 
 from typing import Literal, TypedDict
+from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 
@@ -22,9 +24,13 @@ from agentic_ai.agents.investigation import InvestigationError, investigate
 from agentic_ai.domain.escalation import evaluate
 from agentic_ai.domain.incident import Severity
 from agentic_ai.domain.investigation import InvestigationResult
+from agentic_ai.domain.knowledge import KnowledgeEntry
 from agentic_ai.domain.rca import RootCauseAnalysis
+from agentic_ai.domain.remediation import RemediationPlan
 from agentic_ai.llm.rca import RootCauseAnalysisError, analyze_root_cause
+from agentic_ai.llm.remediation import RemediationPlanningError, plan_remediation
 from agentic_ai.llm.severity import SeverityAssessment, assess_severity
+from agentic_ai.tools.incident_memory import remember
 from agentic_ai.tools.mock_tools import DEFAULT_SCENARIO, Scenario
 
 ESCALATION_SEVERITIES = frozenset({Severity.HIGH, Severity.CRITICAL})
@@ -46,6 +52,9 @@ class IncidentWorkflowState(TypedDict):
     investigation_error: str | None
     root_cause_analysis: RootCauseAnalysis | None
     root_cause_analysis_error: str | None
+    remediation_plan: RemediationPlan | None
+    remediation_plan_error: str | None
+    memory_recorded: bool
     next_step: str | None
 
 
@@ -135,6 +144,61 @@ def analyze_root_cause_node(state: IncidentWorkflowState) -> dict[str, object]:
     return {"root_cause_analysis": analysis, "root_cause_analysis_error": None}
 
 
+def plan_remediation_node(state: IncidentWorkflowState) -> dict[str, object]:
+    """Propose (never execute) remediation steps from the root cause.
+
+    Skipped without an RCA: a plan with no stated cause would be a guess. A
+    failure here does not block escalation, for the same reason an RCA failure
+    does not.
+    """
+    analysis = state["root_cause_analysis"]
+    if analysis is None:
+        return {"remediation_plan": None, "remediation_plan_error": None}
+
+    try:
+        plan = plan_remediation(state["incident_description"], analysis)
+    except RemediationPlanningError as exc:
+        return {"remediation_plan": None, "remediation_plan_error": str(exc)}
+
+    return {"remediation_plan": plan, "remediation_plan_error": None}
+
+
+def remember_incident_node(state: IncidentWorkflowState) -> dict[str, bool]:
+    """Record the analysed incident in long-term memory, flagged as learned.
+
+    Needs an RCA - without a root cause there is nothing worth remembering.
+    A storage failure must not block escalation, and the entry is stored as
+    unverified so later retrieval cannot mistake it for curated precedent.
+    """
+    analysis = state["root_cause_analysis"]
+    if analysis is None:
+        return {"memory_recorded": False}
+
+    plan = state["remediation_plan"]
+    if plan and plan.steps:
+        resolution = "; ".join(
+            f"{step.action_type.value} on {step.target_service}"
+            for step in plan.steps
+        )
+    else:
+        resolution = "No remediation proposed."
+
+    description = state["incident_description"]
+    entry = KnowledgeEntry(
+        id=f"MEM-{uuid4().hex[:8]}",
+        title=description[:80],
+        symptom_description=description,
+        root_cause=analysis.root_cause,
+        resolution=f"Proposed (unexecuted): {resolution}",
+        tags=["learned"],
+        source="learned",
+    )
+    try:
+        return {"memory_recorded": remember(entry)}
+    except OSError:
+        return {"memory_recorded": False}
+
+
 def escalate_node(state: IncidentWorkflowState) -> dict[str, str]:
     """Hand off to a human, with whatever evidence and analysis were gathered."""
     return {"next_step": "escalate"}
@@ -151,6 +215,8 @@ def build_incident_workflow():
     builder.add_node("assess_severity", assess_severity_node)
     builder.add_node("investigate", investigate_node)
     builder.add_node("analyze_root_cause", analyze_root_cause_node)
+    builder.add_node("plan_remediation", plan_remediation_node)
+    builder.add_node("remember_incident", remember_incident_node)
     builder.add_node("escalate", escalate_node)
     builder.add_node("monitor", monitor_node)
 
@@ -166,7 +232,9 @@ def build_incident_workflow():
         },
     )
 
-    builder.add_edge("analyze_root_cause", "escalate")
+    builder.add_edge("analyze_root_cause", "plan_remediation")
+    builder.add_edge("plan_remediation", "remember_incident")
+    builder.add_edge("remember_incident", "escalate")
     builder.add_edge("escalate", END)
     builder.add_edge("monitor", END)
 
@@ -190,6 +258,9 @@ def handle_incident(
             "investigation_error": None,
             "root_cause_analysis": None,
             "root_cause_analysis_error": None,
+            "remediation_plan": None,
+            "remediation_plan_error": None,
+            "memory_recorded": False,
             "next_step": None,
         }
     )

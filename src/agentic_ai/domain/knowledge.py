@@ -11,6 +11,8 @@ Free of LLM, embedding, and framework imports: this describes *what a
 knowledge entry is*, not how it gets embedded or searched.
 """
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -29,6 +31,10 @@ class KnowledgeEntry(BaseModel):
     root_cause: str
     resolution: str
     tags: list[str] = Field(default_factory=list)
+    source: Literal["curated", "learned"] = "curated"
+    """``curated`` entries are hand-written runbooks. ``learned`` entries were
+    written by the system from its own earlier analysis and have not been
+    confirmed by a human - consumers must not treat them as established fact."""
 
     def as_search_text(self) -> str:
         """The text actually embedded and matched against.

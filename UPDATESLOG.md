@@ -1224,6 +1224,59 @@ prompt-section rendering, citation validation including the retry-then-raise pat
 the monitor path, skipped with no findings, skipped when investigation itself failed, a failure inside
 RCA does not block escalation, unexpected errors still propagate, and routing is provably unaffected
 by RCA's content).
+### Phase 7b — Remediation planner: proposals only, risk decided in code ✅
+
+**Built:** `domain/remediation.py` (`RemediationActionType`, `RiskTier`, `RISK_BY_ACTION`,
+`RemediationStep`, `RemediationPlan`), `llm/remediation.py` (`plan_remediation()`), and a
+`plan_remediation` node between `analyze_root_cause` and `escalate`.
+
+**Same shape as RCA, on purpose:** one structured-output call, no tools, no loop, so it lives in
+`llm/`, not `agents/`. It runs only when an RCA exists (no stated cause means a plan would be a
+guess), and a failure inside it does not block escalation.
+
+**Structural, not instructional:** the model picks `action_type` from a closed enum and the target
+from `AVAILABLE_SERVICES`; anything else is invalid output and retried. `risk_tier` is a computed
+field derived from `RISK_BY_ACTION` and absent from the schema the model sees, so a model that
+emits `"risk_tier": "low"` for a rollback is ignored. Tests pin both. `requires_human_approval`
+(any step HIGH or above) previews the Phase 10 gate; nothing is executed.
+
+**Supervisor still not built:** the pipeline remains a fixed sequence with no routing choice between
+agents, so a Supervisor would still be premature.
+
+**178 tests** (12 new: 7 in `test_remediation.py`, 5 workflow integration). Not live-verified
+against OpenRouter in this session.
+
+---
+
+### Phase 8 — Long-term incident memory: persistence without self-confirmation ✅
+
+**Why now:** Phase 6 rejected a vector database because the corpus was static, and named the
+condition for revisiting it: a corpus that changes at runtime and needs persistence. Remembering
+analysed incidents across runs is that condition. Scoped to long-term memory only. Short-term memory
+is already LangGraph state for a single run, and a vector store is still not justified at this volume.
+
+**Built:** `tools/incident_memory.py` (JSON-lines file, path from `AGENTIC_MEMORY_PATH`, default
+`.agentic_memory/incidents.jsonl`, gitignored), a `source: curated | learned` field on
+`KnowledgeEntry`, retrieval over curated corpus plus memory (per-entry embedding cache, memory
+re-read each search), and a `remember_incident` node after `plan_remediation`.
+
+**The risk this phase is really about:** a system that stores its own model-authored RCA and later
+retrieves it as precedent will cite its own guess as established fact. So:
+- Written entries are `learned`, enforced: `remember()` refuses `curated` entries.
+- The search tool returns `source`, and the RCA prompt marks learned results `UNVERIFIED` and
+  instructs they never count as `supported` or `contradicted`. This part is prompt-level, so it is
+  only as strong as the model's compliance; not live-verified.
+- Only incidents with an RCA are remembered, exact duplicates (same symptom and root cause) are
+  skipped, and a write failure does not block escalation. A corrupt line is skipped on load.
+
+**Tests:** a `conftest.py` autouse fixture points memory at a temp file, so no test touches the real
+one. **190 tests** (13 new, one existing field-set assertion updated for `source`).
+
+**Not done:** no human confirmation path, so nothing is ever promoted to `curated`. That needs the
+Phase 10 approval flow. Memory is never pruned. Dedup is exact-match only.
+
+---
+
 ### Hardening — understanding and surfacing the OpenRouter rate limit properly ✅
 
 **Goal:** the free-tier 429 had been hit twice (Phase 5.6, Phase 7) and left as an open known issue
@@ -1382,8 +1435,8 @@ model `nvidia/nemotron-3-super-120b-a12b:free`. Ollama remains available via `LL
 | 4 | LangGraph — state, nodes, routing | ✅ |
 | 5 | Investigation agent + mock tools | ✅ |
 | 6 | RAG — engineering knowledge retrieval | ✅ |
-| 7 | Multi-agent — RCA done; supervisor, remediation planner remain | 🚧 |
-| 8 | Memory — short-term, long-term, vector | ⬜ |
+| 7 | Multi-agent — RCA and remediation planner done; supervisor deferred (no routing choice yet) | ✅ |
+| 8 | Memory — long-term done (file-backed, unverified-by-default); vector store deferred | ✅ |
 | 9 | MCP & tool engineering | ⬜ |
 | 10 | Guardrails — risk tiers, approval gates | ⬜ |
 | 11 | Remediation (mock first) | ⬜ |

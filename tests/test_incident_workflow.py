@@ -9,7 +9,13 @@ from agentic_ai.domain.investigation import (
     TerminationReason,
 )
 from agentic_ai.domain.rca import KnowledgeBaseConsistency, RootCauseAnalysis
+from agentic_ai.domain.remediation import (
+    RemediationActionType,
+    RemediationPlan,
+    RemediationStep,
+)
 from agentic_ai.llm.rca import InvalidRootCauseAnalysisError
+from agentic_ai.llm.remediation import InvalidRemediationPlanError
 from agentic_ai.llm.severity import SeverityAssessment
 from agentic_ai.tools.mock_tools import (
     Scenario,
@@ -80,6 +86,7 @@ def stub_dependencies(monkeypatch):
         error: Exception | None = None,
         rca_result=None,
         rca_error: Exception | None = None,
+        plan_error: Exception | None = None,
     ):
         monkeypatch.setattr(
             workflow_module,
@@ -102,6 +109,21 @@ def stub_dependencies(monkeypatch):
         monkeypatch.setattr(
             workflow_module, "analyze_root_cause", fake_analyze_root_cause
         )
+
+        def fake_plan_remediation(description, analysis):
+            if plan_error is not None:
+                raise plan_error
+            return RemediationPlan(
+                steps=[
+                    RemediationStep(
+                        action_type=RemediationActionType.INCREASE_CONNECTION_POOL,
+                        target_service="payment",
+                        rationale="Pool is exhausted.",
+                    )
+                ]
+            )
+
+        monkeypatch.setattr(workflow_module, "plan_remediation", fake_plan_remediation)
 
     return _apply
 
@@ -341,3 +363,112 @@ def test_routing_is_unaffected_by_rca_regardless_of_its_content(
     # Severity alone already routes this to escalate; a low-confidence RCA
     # conclusion must not change that, since RCA runs strictly after routing.
     assert handle_incident("Payment service is down")["next_step"] == "escalate"
+
+
+# --- remediation planning integration ------------------------------------
+
+
+def test_remediation_plan_is_produced_after_rca(stub_dependencies) -> None:
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[_finding()]))
+
+    state = handle_incident("Payment service is down")
+
+    assert state["next_step"] == "escalate"
+    assert state["remediation_plan"].steps[0].target_service == "payment"
+
+
+def test_remediation_is_skipped_without_an_rca(stub_dependencies) -> None:
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[]))
+
+    state = handle_incident("Payment service is down")
+
+    assert state["remediation_plan"] is None
+    assert state["remediation_plan_error"] is None
+
+
+def test_remediation_does_not_run_on_the_monitor_path(stub_dependencies) -> None:
+    stub_dependencies(Severity.LOW, investigation=_result(findings=[_finding()]))
+
+    assert handle_incident("Minor logging delay")["remediation_plan"] is None
+
+
+def test_remediation_failure_does_not_block_escalation(stub_dependencies) -> None:
+    stub_dependencies(
+        Severity.CRITICAL,
+        investigation=_result(findings=[_finding()]),
+        plan_error=InvalidRemediationPlanError("no valid plan"),
+    )
+
+    state = handle_incident("Payment service is down")
+
+    assert state["next_step"] == "escalate"
+    assert state["remediation_plan"] is None
+    assert "no valid plan" in state["remediation_plan_error"]
+
+
+def test_unexpected_remediation_errors_are_not_swallowed(stub_dependencies) -> None:
+    stub_dependencies(
+        Severity.CRITICAL,
+        investigation=_result(findings=[_finding()]),
+        plan_error=RuntimeError("connection refused"),
+    )
+
+    with pytest.raises(RuntimeError, match="connection refused"):
+        handle_incident("Payment service is down")
+
+
+# --- long-term memory integration ----------------------------------------
+
+
+def test_escalated_incident_is_remembered_as_learned(stub_dependencies) -> None:
+    from agentic_ai.tools.incident_memory import load_memory
+
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[_finding()]))
+
+    state = handle_incident("Payment service is down")
+
+    assert state["memory_recorded"] is True
+    (entry,) = load_memory()
+    assert entry.source == "learned"
+    assert entry.root_cause == "Database connection pool exhaustion."
+    assert "increase_connection_pool" in entry.resolution
+
+
+def test_same_incident_is_not_remembered_twice(stub_dependencies) -> None:
+    from agentic_ai.tools.incident_memory import load_memory
+
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[_finding()]))
+
+    handle_incident("Payment service is down")
+    second = handle_incident("Payment service is down")
+
+    assert second["memory_recorded"] is False
+    assert len(load_memory()) == 1
+
+
+def test_nothing_is_remembered_without_an_rca_or_on_the_monitor_path(
+    stub_dependencies,
+) -> None:
+    from agentic_ai.tools.incident_memory import load_memory
+
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[]))
+    handle_incident("Payment service is down")
+    stub_dependencies(Severity.LOW, investigation=_result(findings=[_finding()]))
+    handle_incident("Minor logging delay")
+
+    assert load_memory() == []
+
+
+def test_memory_write_failure_does_not_block_escalation(
+    stub_dependencies, monkeypatch
+) -> None:
+    def broken_remember(entry):
+        raise OSError("disk full")
+
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[_finding()]))
+    monkeypatch.setattr(workflow_module, "remember", broken_remember)
+
+    state = handle_incident("Payment service is down")
+
+    assert state["next_step"] == "escalate"
+    assert state["memory_recorded"] is False

@@ -60,9 +60,15 @@ def _knowledge_base_section(result: InvestigationResult) -> str:
             continue
 
         for entry in payload.get("results", []):
+            unverified = (
+                " [UNVERIFIED: learned from an earlier automated analysis]"
+                if entry.get("source") == "learned"
+                else ""
+            )
             lines.append(
                 f"- {entry['id']} ({entry['title']}, similarity "
-                f"{entry['similarity']}): root cause was \"{entry['root_cause']}\""
+                f"{entry['similarity']}){unverified}: root cause was "
+                f"\"{entry['root_cause']}\""
             )
 
     return "\n".join(lines) if lines else "No knowledge base matches were found."
@@ -94,7 +100,9 @@ _RCA_INSTRUCTION = (
     "knowledge base search was performed or nothing returned was relevant.\n"
     "- knowledge_base_note: one sentence explaining that consistency "
     "judgement. Empty string if no_relevant_precedent with nothing further "
-    "to add."
+    "to add. Results marked UNVERIFIED are earlier automated guesses, not "
+    "established precedent: they must never count as \"supported\" or "
+    "\"contradicted\" - treat them as no_relevant_precedent."
 )
 
 

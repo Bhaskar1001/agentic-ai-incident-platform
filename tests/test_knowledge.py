@@ -166,6 +166,7 @@ def test_search_tool_returns_success_json_with_expected_fields() -> None:
         "root_cause",
         "resolution",
         "tags",
+        "source",
         "similarity",
     }
 

@@ -18,12 +18,13 @@ from __future__ import annotations
 import numpy as np
 
 from agentic_ai.domain.knowledge import KnowledgeEntry, KnowledgeSearchResult
+from agentic_ai.tools.incident_memory import load_memory
 from agentic_ai.tools.knowledge_corpus import KNOWLEDGE_BASE
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 _model = None
-_corpus_embeddings: np.ndarray | None = None
+_embedding_cache: dict[str, np.ndarray] = {}
 
 
 def _get_model():
@@ -36,41 +37,55 @@ def _get_model():
     return _model
 
 
-def _get_corpus_embeddings() -> np.ndarray:
-    """Embed the corpus once, cached for the process lifetime.
+def _all_entries() -> list[KnowledgeEntry]:
+    """The curated corpus plus whatever long-term memory holds right now.
 
-    The corpus is a static Python list, not loaded from a file or database,
-    so there is no staleness concern here: a code change to the corpus
-    requires a process restart anyway, which naturally re-embeds it.
+    Memory is re-read on every search because it changes at runtime; ids are
+    unique, so a learned entry can never shadow a curated one.
     """
-    global _corpus_embeddings
-    if _corpus_embeddings is None:
-        model = _get_model()
-        texts = [entry.as_search_text() for entry in KNOWLEDGE_BASE]
-        _corpus_embeddings = model.encode(texts, normalize_embeddings=True)
-    return _corpus_embeddings
+    curated_ids = {e.id for e in KNOWLEDGE_BASE}
+    learned = [e for e in load_memory() if e.id not in curated_ids]
+    return [*KNOWLEDGE_BASE, *learned]
+
+
+def _embeddings_for(entries: list[KnowledgeEntry]) -> np.ndarray:
+    """Embed each entry once, keyed by id plus text so an edit re-embeds."""
+    missing = [
+        e for e in entries if _cache_key(e) not in _embedding_cache
+    ]
+    if missing:
+        vectors = _get_model().encode(
+            [e.as_search_text() for e in missing], normalize_embeddings=True
+        )
+        for entry, vector in zip(missing, vectors):
+            _embedding_cache[_cache_key(entry)] = vector
+    return np.stack([_embedding_cache[_cache_key(e)] for e in entries])
+
+
+def _cache_key(entry: KnowledgeEntry) -> str:
+    return f"{entry.id}:{entry.as_search_text()}"
 
 
 def search(query: str, *, top_k: int = 3) -> list[KnowledgeSearchResult]:
     """Return the top_k most similar knowledge entries to ``query``.
 
     Cosine similarity, computed as a plain dot product since both the query
-    and corpus embeddings are L2-normalised at encode time.
+    and entry embeddings are L2-normalised at encode time.
     """
     if not query.strip():
         return []
 
-    model = _get_model()
-    corpus_embeddings = _get_corpus_embeddings()
+    entries = _all_entries()
+    embeddings = _embeddings_for(entries)
 
-    query_embedding = model.encode([query], normalize_embeddings=True)[0]
-    similarities = corpus_embeddings @ query_embedding
+    query_embedding = _get_model().encode([query], normalize_embeddings=True)[0]
+    similarities = embeddings @ query_embedding
 
     ranked_indices = np.argsort(similarities)[::-1][:top_k]
 
     return [
         KnowledgeSearchResult(
-            entry=KNOWLEDGE_BASE[i], similarity=float(similarities[i])
+            entry=entries[i], similarity=float(max(0.0, min(1.0, similarities[i])))
         )
         for i in ranked_indices
     ]
@@ -78,4 +93,4 @@ def search(query: str, *, top_k: int = 3) -> list[KnowledgeSearchResult]:
 
 def get_entry_by_id(entry_id: str) -> KnowledgeEntry | None:
     """Look up a single entry by id, for tests and debugging."""
-    return next((e for e in KNOWLEDGE_BASE if e.id == entry_id), None)
+    return next((e for e in _all_entries() if e.id == entry_id), None)
