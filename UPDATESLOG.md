@@ -5,7 +5,7 @@
 >
 > **Last updated:** 2026-10-26 · **Current phase:** Phases 1-18 have code and tests (766 passing
 > and 196 skipped without a database; 962 passing with one). Phases 17 (approval API) and 18
-> (resume the stored plan, execution ledger) are committed locally and not pushed. The pipeline now runs end to end: assess, investigate, route on evidence, root cause
+> (resume the stored plan, execution ledger) are committed and pushed. The pipeline now runs end to end: assess, investigate, route on evidence, root cause
 > analysis, remediation plan, guardrails, **simulated** execution, deterministic verification, memory,
 > then resolve or escalate. It is wrapped in a FastAPI service, a demo CLI, structured tracing, a
 > golden-case evaluation harness, a Dockerfile and CI.
@@ -13,8 +13,8 @@
 > **Read this before trusting the roadmap:** most of what is "done" is simulated or unconnected.
 > Execution and verification act on mocks; approvals can now be granted over HTTP but the approver is
 > an unauthenticated label; and the Docker image has never been built. Persistence is now real: the API saves each run to PostgreSQL when
-> `DATABASE_URL` is set, verified against an embedded PostgreSQL 16.2 (not yet in CI, and no other
-> server). The default LLM model is currently dead upstream. See sections 5 and 6.
+> `DATABASE_URL` is set, verified against an embedded PostgreSQL 16.2 and, in CI, against the official
+> `postgres:16` image (GitHub Actions is green). The default LLM model is currently dead upstream. See sections 5 and 6.
 >
 > The log was stale from 2026-10-16 (Phase 10) to 2026-10-25: Phases 11-16 were written outside the
 > sessions that produced the earlier entries, then reviewed and committed together. Their entries
@@ -1482,9 +1482,9 @@ no evaluation. There is no scoring of live-model output and no stored baseline t
 **Not done or unverified:**
 - **The Docker image has never been built or run.** Image size is unmeasured, and `sentence-transformers`
   pulls in a large dependency tree. The memory directory inside the container is not a volume.
-- **CI will fail on the live-LLM test.** `test_assess_severity_live` has no skip guard and CI has no
-  API key. This is a defect in the committed workflow, not yet fixed. Also, `ruff format --check`
-  covers only a hand-picked list of files.
+- **CI would fail on the live-LLM test, and its format check covered a hand-picked file list.** *(Both
+  fixed in `12e67b8` and `d39079a`; see the CI fix entry. CI itself is now green, see the first-run
+  entry.)* At the time of this phase `test_assess_severity_live` had no skip guard and CI has no API key.
 - **There is no approval endpoint.** The only routes are the three above, so nothing can call
   `GuardedPlan.approve()`. HIGH-risk steps can never be authorised.
 - No authentication, no rate limiting, and the workflow runs inside the request handler, so a slow
@@ -1567,7 +1567,8 @@ regression test builds the state from real planner, guardrail and executor objec
   accumulated); `POST /incidents` to the database and back through `GET` works; the migrate command
   run twice reports `Applied: 001` then `Database is up to date.`
 - The whole suite also passes with `DATABASE_URL` set, which is what CI will do.
-- **Not verified:** the CI workflow itself (GitHub Actions was not run), and any PostgreSQL other
+- **Not verified at the time** (GitHub Actions has since passed on the official `postgres:16` image; see
+  the first-run entry): the CI workflow itself, and any PostgreSQL other
   than that embedded 16.2 build (no Docker daemon was available; no managed or containerised server).
 
 **Tests:** 493 passed, 3 skipped without a database; 496 passed with one. The three skips are the
@@ -1695,8 +1696,8 @@ endpoints says "NOT authenticated". Do not rely on it as authorization.
 - A test that assumed 001 was the only migration was corrected, and a test for upgrading a
   database that only has 001 was added.
 
-**Not verified.** The GitHub Actions run (the workflow's `postgres:16` service now also runs these
-legs, unconfirmed). Any PostgreSQL other than that embedded 16.2 build. A real `uvicorn` server (HTTP
+**Not verified at the time.** The GitHub Actions run, which has since passed on the official `postgres:16`
+image (see the first-run entry). Any PostgreSQL other than that embedded 16.2 build, then. A real `uvicorn` server (HTTP
 tests used `TestClient`). The live-LLM path: the live test was not run (and currently fails upstream, see
 below), so no external quota was spent.
 
@@ -1830,7 +1831,8 @@ and error text omitted). `POST /incidents` now also hands the ledger to the work
   which may carry looser guardrail inputs. It is now a storage sequence (`snapshot_seq`; insertion order
   in memory), with a test that stores same-instant snapshots 12 times and fails against the old ordering.
 
-**Not verified.** The GitHub Actions run. Any PostgreSQL other than that embedded 16.2 build. A real
+**Not verified at the time.** The GitHub Actions run (since green, see the first-run entry) and any
+PostgreSQL other than that embedded 16.2 build. A real
 `uvicorn` server (HTTP tests use `TestClient`). Any real external executor: remediation is still
 simulated, so the exactly-once limitation above is reasoned about and tested against fakes, not observed.
 
@@ -1851,6 +1853,51 @@ simulated, so the exactly-once limitation above is reasoned about and tested aga
   (its steps are not re-executed, thanks to the ledger, but the save is refused as a conflict).
 - Post-remediation verification still reads an injected scenario (Phase 12 gap, unchanged).
 - Resume takes no automatic retry on any failure, by design.
+
+---
+
+### The first GitHub Actions run, and what it found ✅ · `0b3d2fe`, `b97b531`, `5765715`
+
+Everything through Phase 18 was pushed (`dc31bc1..ff7b4ec`) after a scan of all unpushed commits and the
+full history for secrets (only obviously fake test values; no real key was ever committed). That was
+the first time the workflow had ever run, and it went red twice before going green.
+
+**Run 1 (`ff7b4ec`): failed at the test step only.** Checkout, `uv sync --frozen`, ruff lint, ruff format
+and the `postgres:16` container all passed. GitHub's job logs need repository admin rights, so the
+failure could not be read directly. Reproducing CI's conditions locally (a clean checkout, no `.env`, no
+key, PostgreSQL attached, nothing deselected) found two failures, both **query-plan assertions on the
+pending-approvals queue** that ran on a near-empty table. On a handful of rows a bitmap scan plus a sort
+is legitimately cheaper than the partial index, and which one PostgreSQL picks depends on table
+statistics. The index itself is sound: on a realistic table (2000 approvals, 2% pending, fresh
+statistics) all three query shapes `list_pending_approvals` issues use it with no sort. The tests now seed
+that realistic table first (`0b3d2fe`).
+
+**Run 2 (`0b3d2fe`): still failed.** So that was not the whole story, and guessing further would have
+been blind. The workflow now reports failing tests, the first failure's details and pytest's summary as
+**annotations**, which anyone who can see the run can read (`b97b531`).
+
+**Run 3 (`b97b531`): the annotations named the cause.** Ten PostgreSQL schema tests failed with
+`fe_sendauth: no password supplied`. They opened a second connection from psycopg's `conn.info.dsn`,
+which deliberately omits the password. The embedded PostgreSQL used locally trusts every connection, so
+this could never fail there; CI's `postgres:16` requires a password. The tests now build the repository
+from `DATABASE_URL` through a shared `pg_repository()` helper (`5765715`). Nothing in `src/` was affected.
+To prove the diagnosis before pushing, the local server was made to behave like CI's (its `pg_hba.conf`
+switched from `trust` to `scram-sha-256`, plus a password): the old tests then failed in exactly the ten
+reported places, and the fixed tests passed. That harness lives in the scratch area, not in the repository.
+
+**Run 4 (`5765715`): green.** Run `40187027504`: install, lint, format check and the full suite against the
+official `postgres:16` image with password authentication all passed on the Ubuntu runner. The failing
+run had counted 952 passed, 10 failed and 1 skipped (963 tests); the live-LLM test is the skip, correctly
+skipping without a key.
+
+**What CI now verifies that nothing local did:** a second PostgreSQL build (the official 16 image, not the
+embedded 16.2), password authentication, Linux, and installation from the lockfile on a clean machine.
+It also resolves the earlier open items "CI's PostgreSQL service not yet exercised" and the two "GitHub
+Actions was not run" notes in the Phase 16b to 18 entries.
+
+**Still not verified:** the Docker image build, a real `uvicorn` deployment, and the live-LLM path. CI
+warns that `actions/checkout@v4` and `astral-sh/setup-uv@v5` target Node 20, which GitHub is deprecating
+(it currently forces Node 24 and the actions still work); they should be bumped.
 
 ---
 
@@ -2003,9 +2050,9 @@ src/agentic_ai/
 **Commit index:** Phases 1-7 and the rate-limit hardening, up to `dc31bc1` (pushed) · Phase 7b and 8 `c59edc6` · Phase 9 `3f1807c` ·
 Phase 10 `b3b2b75` · CI fix `d39079a`, `12e67b8` · Phase 16b `eaad8fd`, `9bbb696`, `56813a4`, `7d3dcb3` · Phase 11 `0397465` · Phase 12 `b5fd76d` · Phase 14 `73f5e20` · workflow
 integration `6fcf672` · Phase 13 `14a42cb` · Phase 15 `52e2a5e`, `b5078b8` · Phase 16 `a0c22a2` ·
-README `d1b7de2` · Phase 17 `c962312` · Phase 18 core `73cb8a4` · Phase 18 integration (the
-commit after it). Everything after `dc31bc1` is committed locally and not pushed (`main` is 23
-commits ahead of `origin/main`).
+README `d1b7de2` · Phase 17 `c962312` · Phase 18 core `73cb8a4` · Phase 18 integration `ff7b4ec` · CI diagnosis
+and fixes `0b3d2fe`, `b97b531`, `5765715`. All of these are pushed to `origin/main`; commits made after
+`5765715` (this log update) are local until pushed.
 
 ---
 
@@ -2034,7 +2081,9 @@ commits ahead of `origin/main`).
 | CI fails on the live-LLM test | Resolved | The test skips without a key and has a `live` marker (`12e67b8`) |
 | `ruff format --check` covers a hand-picked file list | Resolved | Now `ruff format --check .` after a mechanical reformat (`d39079a`) |
 | Default OpenRouter model returns 404 | **Open, blocks live use** | `nvidia/nemotron-3-super-120b-a12b:free` is still listed but the upstream provider answers `Function '...': Not found for account`. Live runs and the app's default model fail until another free model is chosen, which also spends the 50 requests/day quota |
-| CI's PostgreSQL service not yet exercised | Open | The workflow adds `postgres:16` and `DATABASE_URL`, so the approval PostgreSQL legs would run there; GitHub Actions was not run, so whether they pass there is unconfirmed |
+| CI's PostgreSQL service | Resolved | Run `40187027504` on `5765715` passed with the PostgreSQL tests running against the official `postgres:16` image with password authentication |
+| GitHub Actions uses Node 20 actions | Open | `actions/checkout@v4` and `astral-sh/setup-uv@v5` target Node 20, which GitHub is deprecating (it currently forces Node 24; they still work). Bump the versions |
+| Local PostgreSQL is more permissive than CI's | Open, mitigated | The embedded server trusts every connection and hid a password bug that only CI exposed. Re-check anything touching connections against a password-authenticated server (a scratch harness did this for the fix) |
 | Docker image never built or run | Open | Image size unmeasured; `sentence-transformers` is a heavy dependency; memory directory is not a volume |
 | Postgres verified on one build only | Partly resolved | Migrations 001-002, the repository and the approval flow pass against an embedded PostgreSQL 16.2 (`pgserver`, Windows), including a threaded race and the constraints. Not run on Docker, a managed service, or other versions |
 | Persistence unconnected | Resolved for the API | `POST /incidents` saves and `GET /incidents/{id}` reads (`56813a4`). The workflow itself, the CLI and the evaluation runner do not write to a repository |
@@ -2046,7 +2095,7 @@ commits ahead of `origin/main`).
 | Learned memory can record simulated success as fact | Open | An entry can read "Recovery: verified recovered" for a remediation that did nothing. Still `learned` and unverified at retrieval |
 | API has no auth, rate limiting or async handling | Open | `POST /incidents` runs the whole workflow, including LLM calls, synchronously in the handler |
 | Evaluation measures the pipeline, not the model | Open | 9 golden cases with stubbed LLM steps; nothing scores live-model narrative accuracy or tracks regression |
-| Nothing after `dc31bc1` is pushed | Open | `main` is 23 commits ahead of `origin/main` |
+| Unpushed commits | Resolved | Everything through `5765715` is on `origin/main`; later local commits are unpushed until pushed |
 | `AVAILABLE_SERVICES` mutability | Minor | `list` → `tuple` would prevent accidental mutation |
 | Linter / formatter | Resolved (partly) | `ruff` configured and lint passes; see the format-check gap above |
 | Git author identity | Unconfigured | Commits carry an auto-guessed name/email on a public repo |
@@ -2080,8 +2129,8 @@ commits ahead of `origin/main`).
 | 12 | Verification — single deterministic check; no retry loop; recovery injected | 🚧 |
 | 13 | Evaluation — 9 golden cases over the stubbed pipeline; no model-quality scoring | 🚧 |
 | 14 | Observability — spans, JSON logs, redaction; no token counts, no trace retrieval | 🚧 |
-| 15 | Production — API, config, CLI, Docker, CI done; Docker unbuilt, CI has a defect; K8s, AWS, Terraform not started | 🚧 |
-| 16 | Persistence — PostgreSQL repository, migrations, API saves and reads runs; verified on one embedded build, not in CI yet; workflow/CLI do not write | 🚧 |
+| 15 | Production — API, config, CLI, Docker, CI done; CI is green on GitHub (`5765715`); Docker image unbuilt; K8s, AWS, Terraform not started | 🚧 |
+| 16 | Persistence — PostgreSQL repository, migrations, API saves and reads runs; verified on an embedded 16.2 build and in CI on the `postgres:16` image; workflow/CLI do not write | 🚧 |
 | 17 | Approval API — persisted approvals, approve/reject/list endpoints, enforced before execution; approver unauthenticated | ✅ |
 | 18 | Resume the stored plan — immutable snapshot, no-LLM resume, durable execution ledger, pending-queue endpoint; unauthenticated | ✅ |
 | — | **Next:** authentication for approver and operator; an operator action to resolve an unknown step outcome; notification when an approval is waiting; commit and push | ⬜ |
@@ -2208,3 +2257,10 @@ Extracted from decisions actually made in this project, not aspirational:
 38. **"Latest" must not be decided by a clock.** Two things stored within one clock tick tie, and a
     random tiebreak then picks the wrong one some of the time. It surfaced only because the same
     tests were run many times in a row; one green run would have shipped it. Use a sequence.
+39. **A test environment that is more permissive than production hides a whole class of bugs.** The
+    local database trusted every connection, so code that dropped the password could not fail there.
+    The first real CI run found it in minutes. Make the local replica as strict as the real thing
+    (here, password authentication) before trusting a green run.
+40. **Make failures readable where they happen.** Two CI runs were spent unable to see why a test
+    failed, because the job log needed admin rights. Printing failures as annotations turned a blind
+    guess into a one-line diagnosis. Do not keep changing things while you cannot see the error.
