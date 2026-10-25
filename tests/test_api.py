@@ -34,6 +34,8 @@ from agentic_ai.domain.remediation import (
 from agentic_ai.domain.verification import VerificationResult, VerificationStatus
 from agentic_ai.llm.client import LLMConfigurationError, LLMRateLimitError
 from agentic_ai.llm.severity import SeverityAssessment
+from agentic_ai.persistence.in_memory import InMemoryIncidentRepository
+from agentic_ai.persistence.repository import IncidentConflictError
 from agentic_ai.tools.mock_tools import Scenario, get_mock_metrics, get_mock_pod_status
 from agentic_ai.workflows import incident as workflow_module
 
@@ -84,6 +86,22 @@ def _analysis() -> RootCauseAnalysis:
         root_cause="Database connection pool exhaustion.",
         root_cause_confidence=0.9,
         knowledge_base_consistency=KnowledgeBaseConsistency.NO_RELEVANT_PRECEDENT,
+    )
+
+
+@pytest.fixture(autouse=True)
+def isolated_repository(monkeypatch):
+    """No API test may reach a real database, whatever DATABASE_URL says.
+
+    ``agentic_ai.api`` re-exports the ``app`` object, which shadows the ``app``
+    submodule as an attribute, so the module is fetched from ``sys.modules``.
+    """
+    import sys
+
+    monkeypatch.setattr(
+        sys.modules["agentic_ai.api.app"],
+        "build_repository",
+        lambda settings: InMemoryIncidentRepository(),
     )
 
 
@@ -382,3 +400,93 @@ def test_submit_incident_sanitized_trace_no_secret_leak(stub_dependencies) -> No
     )
     assert response.status_code == 200
     assert "sk-ant-secret-key-12345" not in response.text
+
+
+# --- persistence wiring ---------------------------------------------------------
+
+_RECOVERY_PAYLOAD = {
+    "incident_description": "Database connection pool saturated",
+    "scenario": "connection_pool_exhaustion",
+    "post_remediation_scenario": "healthy",
+    "incident_id": "INC-PERSIST-1",
+}
+
+
+def _critical_run(stub_dependencies) -> None:
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[_finding()]))
+
+
+def test_posted_incident_is_saved_and_can_be_fetched(stub_dependencies) -> None:
+    """End to end with real guardrail and executor objects: the run is stored."""
+    _critical_run(stub_dependencies)
+    repo = InMemoryIncidentRepository()
+    client = TestClient(create_app(repository=repo))
+
+    posted = client.post("/incidents", json=_RECOVERY_PAYLOAD)
+    assert posted.status_code == 200
+    assert posted.json()["persisted"] is True
+
+    fetched = client.get("/incidents/INC-PERSIST-1")
+    assert fetched.status_code == 200
+    body = fetched.json()
+    assert body["incident_id"] == "INC-PERSIST-1"
+    assert body["status"] == "resolved"
+    assert body["final_outcome"] == "resolve"
+    assert body["verification"]["status"] == "recovered"
+    assert [r["action_type"] for r in body["remediations"]] == ["increase_connection_pool"]
+    assert body["remediations"][0]["execution_status"] == "executed"
+    assert body["stages"], "stage spans from the trace should be stored"
+    assert repo.count() == 1
+
+
+def test_unknown_incident_is_404() -> None:
+    client = TestClient(create_app(repository=InMemoryIncidentRepository()))
+    response = client.get("/incidents/INC-NOPE")
+    assert response.status_code == 404
+    assert "INC-NOPE" in response.json()["detail"]
+
+
+class _BrokenRepository(InMemoryIncidentRepository):
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self._error = error
+
+    def save_incident(self, record):
+        raise self._error
+
+    def get_incident(self, incident_id):
+        raise self._error
+
+
+def test_a_failed_save_does_not_hide_the_result(stub_dependencies) -> None:
+    _critical_run(stub_dependencies)
+    client = TestClient(create_app(repository=_BrokenRepository(RuntimeError("db down"))))
+
+    response = client.post("/incidents", json=_RECOVERY_PAYLOAD)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["persisted"] is False
+    assert body["outcome"] == "resolve"
+
+
+def test_a_conflicting_resubmission_is_reported_not_raised(stub_dependencies) -> None:
+    _critical_run(stub_dependencies)
+    repo = _BrokenRepository(IncidentConflictError("terminal record differs"))
+    client = TestClient(create_app(repository=repo))
+
+    response = client.post("/incidents", json=_RECOVERY_PAYLOAD)
+
+    assert response.status_code == 200
+    assert response.json()["persisted"] is False
+
+
+def test_storage_failure_on_read_is_503_without_leaking_the_error() -> None:
+    client = TestClient(
+        create_app(repository=_BrokenRepository(RuntimeError("password=hunter2 refused")))
+    )
+
+    response = client.get("/incidents/INC-1")
+
+    assert response.status_code == 503
+    assert "hunter2" not in response.text

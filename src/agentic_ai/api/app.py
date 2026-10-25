@@ -3,7 +3,9 @@
 Exposes:
 - GET /health: Liveness probe without LLM or external calls.
 - GET /ready: Readiness check reflecting configuration status without exposing credentials.
-- POST /incidents: Ingests an incident, triggers handle_incident(), and returns structured outcome.
+- POST /incidents: Ingests an incident, triggers handle_incident(), saves the run, and returns
+  the structured outcome.
+- GET /incidents/{incident_id}: Returns a previously saved incident record.
 """
 
 from __future__ import annotations
@@ -30,15 +32,25 @@ from agentic_ai.config import (
     Settings,
     get_settings,
 )
+from agentic_ai.domain.persistence import IncidentRecord
 from agentic_ai.llm.client import LLMConfigurationError, LLMRateLimitError
+from agentic_ai.persistence.factory import build_repository
+from agentic_ai.persistence.repository import IncidentConflictError, IncidentRepository
 from agentic_ai.tools.mock_tools import DEFAULT_SCENARIO, Scenario
 from agentic_ai.workflows.incident import handle_incident
 
 logger = logging.getLogger("agentic_ai.api")
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
-    """Create and configure the FastAPI service instance."""
+def create_app(
+    settings: Settings | None = None,
+    repository: IncidentRepository | None = None,
+) -> FastAPI:
+    """Create and configure the FastAPI service instance.
+
+    ``repository`` is injected for tests; otherwise it is built lazily from the
+    settings on first use (PostgreSQL when ``DATABASE_URL`` is set).
+    """
     app = FastAPI(
         title="AI Engineering & Incident Resolution Platform API",
         description="Autonomous, safety-bounded incident investigation and resolution service.",
@@ -48,10 +60,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Attach settings or dynamic resolver
     app.state.settings = settings
 
+    app.state.repository = repository
+
     def _current_settings() -> Settings:
         if app.state.settings is not None:
             return app.state.settings
         return get_settings()
+
+    def _repository() -> IncidentRepository:
+        if app.state.repository is None:
+            app.state.repository = build_repository(_current_settings())
+        return app.state.repository
 
     @app.exception_handler(RequestValidationError)
     def _validation_exception_handler(
@@ -233,6 +252,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if state.get("severity_assessment"):
             severity_val = state["severity_assessment"].severity.value
 
+        # The run has already happened (and any simulated remediation with it), so a
+        # failure to save must not hide the result. Report it instead.
+        persisted = False
+        try:
+            _repository().save_incident(IncidentRecord.from_workflow_state(state))
+            persisted = True
+        except IncidentConflictError as exc:
+            logger.error("Incident record conflicts with the stored one: %s", exc)
+        except Exception as exc:
+            logger.error("Failed saving incident record: %s", type(exc).__name__)
+
         return IncidentResponse(
             incident_id=state["incident_id"],
             correlation_id=state["correlation_id"],
@@ -241,7 +271,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             diagnostic=diag_summary,
             verification=verif_summary,
             trace=state.get("trace"),
+            persisted=persisted,
         )
+
+    @app.get(
+        "/incidents/{incident_id}",
+        response_model=IncidentRecord,
+        responses={404: {"model": ErrorResponse, "description": "Incident not found"}},
+        summary="Fetch a Saved Incident",
+        tags=["Incidents"],
+    )
+    def get_incident(incident_id: str) -> IncidentRecord:
+        """Return the stored audit record for one incident."""
+        try:
+            record = _repository().get_incident(incident_id)
+        except Exception as exc:
+            logger.error("Failed reading incident record: %s", type(exc).__name__)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Incident storage is unavailable.",
+            ) from exc
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Incident '{incident_id}' not found.",
+            )
+        return record
 
     return app
 
