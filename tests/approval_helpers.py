@@ -257,3 +257,37 @@ class WrappedStore:
 
 def boom(*args, **kwargs):
     raise RuntimeError("database down")
+
+
+def seed_realistic_approvals(conn, n: int = 2000) -> None:
+    """Fill the approvals table the way it looks in use: many decided, few pending.
+
+    A query-plan assertion on a near-empty table is meaningless: PostgreSQL rightly prefers a
+    bitmap scan and a sort over a handful of rows, and which it picks depends on table
+    statistics. With a realistic distribution (here 2% pending) and fresh statistics the
+    choice is stable. Every id carries the ``TEST-APR-`` prefix, so the fixtures' teardown
+    removes these rows.
+    """
+    conn.execute(
+        "INSERT INTO incidents (incident_id, correlation_id, scenario, incident_description, "
+        "severity, status) SELECT 'TEST-APR-SEED-' || g, 'C', 's', 'd', 'high', "
+        "'awaiting_approval' FROM generate_series(1, %s) g",
+        (n,),
+    )
+    conn.execute(
+        "INSERT INTO incident_approvals (approval_id, incident_id, plan_fingerprint, step_index, "
+        "step_fingerprint, action_type, target_service, status, decided_at, approver) "
+        "SELECT 'APR-SEED-' || g, 'TEST-APR-SEED-' || g, repeat('a', 64), 0, repeat('b', 64), "
+        # (%% is a literal modulo: this statement also carries a %s parameter.)
+        "'failover', 'payment', CASE WHEN g %% 50 = 0 THEN 'pending' ELSE 'approved' END, "
+        "CASE WHEN g %% 50 = 0 THEN NULL ELSE now() END, "
+        "CASE WHEN g %% 50 = 0 THEN NULL ELSE 'x' END FROM generate_series(1, %s) g",
+        (n,),
+    )
+    conn.execute("ANALYZE incident_approvals")
+
+
+def explain(conn, sql: str) -> list[str]:
+    """The query plan as lines, with sequential scans discouraged so an index is shown if usable."""
+    conn.execute("SET enable_seqscan = off")
+    return [row[0] for row in conn.execute("EXPLAIN " + sql).fetchall()]

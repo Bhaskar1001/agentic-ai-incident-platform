@@ -35,6 +35,8 @@ from tests.approval_helpers import (
     HIGH_FAILOVER,
     HIGH_ROLLBACK,
     LOW,
+    explain,
+    seed_realistic_approvals,
     guarded,
     new_incident_id,
     saved_incident,
@@ -427,17 +429,20 @@ def test_pending_approvals_are_served_by_the_partial_index(pg_connection) -> Non
     assert "WHERE" in indexes["idx_incident_approvals_pending"]
     assert "idx_incident_approvals_incident_status" in indexes
 
-    # With sequential scans disabled the planner must use an index for the queue query,
-    # and the partial one is the only candidate that matches it.
-    pg_connection.execute("SET enable_seqscan = off")
+    # On a realistic table (many decided approvals, few pending) the queue query is served by
+    # the partial index, which also supplies the ordering, so no sort is needed. (A near-empty
+    # table proves nothing: PostgreSQL rightly prefers a bitmap scan and a sort over a handful
+    # of rows, and which it picks depends on table statistics.)
+    seed_realistic_approvals(pg_connection)
     plan = "\n".join(
-        row[0]
-        for row in pg_connection.execute(
-            "EXPLAIN SELECT approval_id FROM incident_approvals "
-            "WHERE status = 'pending' ORDER BY requested_at, approval_id LIMIT 50"
-        ).fetchall()
+        explain(
+            pg_connection,
+            "SELECT approval_id FROM incident_approvals WHERE status = 'pending' "
+            "ORDER BY requested_at, approval_id LIMIT 50",
+        )
     )
     assert "idx_incident_approvals_pending" in plan
+    assert "Sort" not in plan
 
 
 def test_migration_002_can_be_run_again_without_error(pg_connection) -> None:

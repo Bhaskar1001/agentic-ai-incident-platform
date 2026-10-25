@@ -34,6 +34,8 @@ from tests.approval_helpers import (
     HIGH_FAILOVER,
     HIGH_ROLLBACK,
     analysis,
+    explain,
+    seed_realistic_approvals,
     guarded,
     new_incident_id,
     saved_incident,
@@ -577,16 +579,20 @@ def test_the_lock_dies_with_its_session(pg_clean) -> None:
             assert taken_over is True  # the dead session's lock is gone
 
 
-def test_pending_queue_query_can_use_the_partial_index(pg_clean) -> None:
-    pg_clean.execute("SET enable_seqscan = off")
-    plan = "\n".join(
-        row[0]
-        for row in pg_clean.execute(
-            "EXPLAIN SELECT approval_id FROM incident_approvals WHERE status = 'pending' "
-            "AND target_service = 'x' ORDER BY requested_at, approval_id LIMIT 50 OFFSET 0"
-        ).fetchall()
-    )
-    assert "idx_incident_approvals_pending" in plan
+def test_the_paginated_filtered_queue_is_served_by_the_partial_index(pg_clean) -> None:
+    """The shapes ``list_pending_approvals`` issues, on a realistic table (see the seed helper)."""
+    seed_realistic_approvals(pg_clean)
+    for extra in ("", "AND target_service = 'payment' ", "AND action_type = 'failover' "):
+        plan = "\n".join(
+            explain(
+                pg_clean,
+                "SELECT approval_id FROM incident_approvals WHERE status = 'pending' "
+                + extra
+                + "ORDER BY requested_at, approval_id LIMIT 50 OFFSET 0",
+            )
+        )
+        assert "idx_incident_approvals_pending" in plan, plan
+        assert "Sort" not in plan, plan
 
 
 # the datetime import is used by fixtures above in some Python versions' lint passes
