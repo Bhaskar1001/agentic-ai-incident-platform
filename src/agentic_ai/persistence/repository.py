@@ -7,8 +7,11 @@ PostgreSQL, etc.).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
+from agentic_ai.domain.approvals import ApprovalRecord
+from agentic_ai.domain.guardrails import ApprovalState
 from agentic_ai.domain.persistence import IncidentLifecycleStatus, IncidentRecord
 
 
@@ -29,6 +32,28 @@ class IncidentConflictError(IncidentPersistenceError):
 
     def __init__(self, message: str) -> None:
         super().__init__(message)
+
+
+class ApprovalNotFoundError(IncidentPersistenceError):
+    """No such approval *for that incident*.
+
+    An approval that exists but belongs to a different incident raises this too:
+    the caller is told the same thing either way, so one incident's URL cannot be
+    used to probe another incident's approvals.
+    """
+
+    def __init__(self, incident_id: str, approval_id: str) -> None:
+        super().__init__(f"Approval '{approval_id}' not found for incident '{incident_id}'.")
+        self.incident_id = incident_id
+        self.approval_id = approval_id
+
+
+class ApprovalConflictError(IncidentPersistenceError):
+    """The approval exists but cannot be decided now.
+
+    Already decided, the incident is closed, or the remediation plan it referred
+    to was replaced. Never overwritten, never retried.
+    """
 
 
 @runtime_checkable
@@ -129,9 +154,79 @@ class IncidentRepository(Protocol):
         ...
 
 
+@runtime_checkable
+class ApprovalRepository(Protocol):
+    """Storage for persisted approvals of high-risk remediation steps.
+
+    Implementations must keep approvals tied to an existing incident, make a
+    decision atomic (exactly one decision per approval, ever), and behave
+    identically across backends.
+    """
+
+    def request_approvals(self, approvals: Sequence[ApprovalRecord]) -> list[ApprovalRecord]:
+        """Store pending approvals, idempotently.
+
+        An approval for the same ``(incident, plan, step)`` that already exists is
+        kept exactly as it is, never reset to pending, and returned in place of
+        the new one. Results are in input order.
+
+        Raises
+        ------
+        IncidentNotFoundError
+            If an approval refers to an incident that is not stored.
+        """
+        ...
+
+    def get_approval(self, incident_id: str, approval_id: str) -> ApprovalRecord | None:
+        """Fetch one approval, or None if it does not exist *for that incident*."""
+        ...
+
+    def list_approvals(
+        self, incident_id: str, status: ApprovalState | None = None
+    ) -> list[ApprovalRecord]:
+        """An incident's approvals, oldest request first, optionally by status."""
+        ...
+
+    def list_pending_approvals(self, limit: int = 50) -> list[ApprovalRecord]:
+        """Pending approvals across all incidents, oldest request first."""
+        ...
+
+    def decide_approval(
+        self,
+        incident_id: str,
+        approval_id: str,
+        outcome: ApprovalState,
+        approver: str,
+        reason: str | None = None,
+    ) -> ApprovalRecord:
+        """Approve or reject a pending approval, atomically.
+
+        Raises
+        ------
+        IncidentNotFoundError
+            If the incident does not exist.
+        ApprovalNotFoundError
+            If the approval does not exist for that incident.
+        ApprovalConflictError
+            If it is not pending, the incident is closed, or its plan was replaced.
+        ValueError
+            If ``outcome`` is not approved/rejected or ``approver`` is blank.
+        """
+        ...
+
+
+@runtime_checkable
+class IncidentStore(IncidentRepository, ApprovalRepository, Protocol):
+    """What the API needs: incident records and their approvals in one store."""
+
+
 __all__ = [
+    "ApprovalConflictError",
+    "ApprovalNotFoundError",
+    "ApprovalRepository",
     "IncidentConflictError",
     "IncidentNotFoundError",
     "IncidentPersistenceError",
     "IncidentRepository",
+    "IncidentStore",
 ]

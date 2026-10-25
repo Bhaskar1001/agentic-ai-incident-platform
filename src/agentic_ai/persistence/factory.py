@@ -5,10 +5,10 @@ from __future__ import annotations
 from agentic_ai.config import Settings
 from agentic_ai.persistence.in_memory import InMemoryIncidentRepository
 from agentic_ai.persistence.postgres import PostgresIncidentRepository
-from agentic_ai.persistence.repository import IncidentRepository
+from agentic_ai.persistence.repository import IncidentStore
 
 
-def build_repository(settings: Settings) -> IncidentRepository:
+def build_repository(settings: Settings) -> IncidentStore:
     """PostgreSQL when ``DATABASE_URL`` is set, otherwise process-local memory.
 
     The in-memory fallback keeps local runs and tests dependency-free, but its

@@ -196,11 +196,11 @@ def test_apply_migrations_idempotency_when_already_applied() -> None:
     runner = MigrationRunner()
     conn = MockConnection()
 
-    # Pre-populate schema_migrations with existing applied migration 001
-    discovered = runner.discover_migrations()
-    m001 = discovered[0]
+    # Every discovered migration is already recorded as applied. (This test used to
+    # record only 001, which silently assumed 001 was the only migration.)
     conn.schema_migrations_rows = [
-        (m001.version, m001.name, m001.checksum, datetime.now(timezone.utc))
+        (m.version, m.name, m.checksum, datetime.now(timezone.utc))
+        for m in runner.discover_migrations()
     ]
 
     applied = runner.apply_migrations(conn)
@@ -208,6 +208,40 @@ def test_apply_migrations_idempotency_when_already_applied() -> None:
     assert len(applied) == 0
     # No pending migrations executed
     assert conn.rollbacks == 0
+
+
+def test_apply_migrations_upgrades_a_database_that_only_has_001() -> None:
+    """The approvals migration is picked up by a database created before it existed."""
+    runner = MigrationRunner()
+    conn = MockConnection()
+    m001 = runner.discover_migrations()[0]
+    conn.schema_migrations_rows = [
+        (m001.version, m001.name, m001.checksum, datetime.now(timezone.utc))
+    ]
+
+    applied = runner.apply_migrations(conn)
+
+    assert [m.version for m in applied] == ["002"]
+    assert conn.rollbacks == 0
+
+
+def test_migration_002_defines_the_approval_schema() -> None:
+    sql = {m.version: m.sql for m in MigrationRunner().discover_migrations()}["002"]
+
+    assert "CREATE TABLE IF NOT EXISTS incident_approvals" in sql
+    # Tied to the incident by foreign key, which restricts rather than cascades.
+    assert "REFERENCES incidents(incident_id) ON DELETE RESTRICT" in sql
+    # Status values, the decision-coherence rule, and one approval per step of a plan.
+    assert "IN ('pending', 'approved', 'rejected')" in sql
+    assert "chk_incident_approvals_decision" in sql
+    assert "UNIQUE (incident_id, plan_fingerprint, step_index)" in sql
+    # Pending approvals are retrievable through a partial index.
+    assert "idx_incident_approvals_pending" in sql and "WHERE status = 'pending'" in sql
+    # The incident status constraint is re-created, so re-running is safe.
+    assert "DROP CONSTRAINT IF EXISTS chk_incidents_status" in sql
+    assert "'awaiting_approval'" in sql
+    # Remediation rows are replaced on every save, so approvals must not point at them.
+    assert "REFERENCES incident_remediations" not in sql
 
 
 def test_apply_migrations_checksum_mismatch() -> None:

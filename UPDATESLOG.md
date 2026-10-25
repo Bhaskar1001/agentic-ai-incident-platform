@@ -3,15 +3,16 @@
 > Single source of truth for this project: what it is, why it exists, what has been built in each
 > phase, and the reasoning behind every significant decision.
 >
-> **Last updated:** 2026-10-25 · **Current phase:** Phases 1-16 have code and tests (493 passing
-> and 3 skipped without a database; 496 passing with one). The pipeline now runs end to end: assess, investigate, route on evidence, root cause
+> **Last updated:** 2026-10-25 · **Current phase:** Phases 1-17 have code and tests (630 passing
+> and 92 skipped without a database; 722 passing with one). Phase 17 (the approval API) is
+> committed locally and not pushed. The pipeline now runs end to end: assess, investigate, route on evidence, root cause
 > analysis, remediation plan, guardrails, **simulated** execution, deterministic verification, memory,
 > then resolve or escalate. It is wrapped in a FastAPI service, a demo CLI, structured tracing, a
 > golden-case evaluation harness, a Dockerfile and CI.
 >
 > **Read this before trusting the roadmap:** most of what is "done" is simulated or unconnected.
-> Execution and verification act on mocks; no API route can grant a human approval; and the Docker
-> image has never been built. Persistence is now real: the API saves each run to PostgreSQL when
+> Execution and verification act on mocks; approvals can now be granted over HTTP but the approver is
+> an unauthenticated label; and the Docker image has never been built. Persistence is now real: the API saves each run to PostgreSQL when
 > `DATABASE_URL` is set, verified against an embedded PostgreSQL 16.2 (not yet in CI, and no other
 > server). The default LLM model is currently dead upstream. See sections 5 and 6.
 >
@@ -1589,6 +1590,135 @@ evidence for the SQL.
 
 ---
 
+### Phase 17 — Approval API: persisted, enforced human decisions ✅
+
+**What it does.** A HIGH-risk remediation step that needs a human is now recorded as a
+`PENDING` approval, a person approves or rejects it over HTTP, and the workflow enforces that
+stored decision at the point where execution is authorized. A step cannot execute until its
+*exact* approval is `APPROVED`; pending and rejected decisions are enforced in code.
+
+**The flow.** Submit an incident (`POST /incidents`) -> a high-risk step is skipped and its approval
+is stored as pending (`pending_approval_ids` in the response; incident status `awaiting_approval`)
+-> decide it (`.../approve` or `.../reject`) -> **resubmit the same `incident_id`** -> the workflow
+reads the stored decision, executes the approved step (or keeps skipping a rejected one), verifies,
+and resolves or escalates as before. Recording a decision never executes anything and never
+resolves anything.
+
+**Schema (migration `002_incident_approvals.sql`).** New table `incident_approvals`: `approval_id`
+(`APR-<12 hex>`, matching the `INC-`/`CORR-` id style), `incident_id` (foreign key, `ON DELETE
+RESTRICT`), `plan_fingerprint`, `step_index`, `step_fingerprint`, a snapshot of `action_type` /
+`target_service` / `rationale`, `status` (`pending`/`approved`/`rejected`, lower case like every
+other enum column here), `requested_at`, `decided_at`, `approver`, `decision_reason`. Constraints:
+valid status; a decision always records who and when, a pending approval records neither;
+`step_index >= 0`; `UNIQUE (incident_id, plan_fingerprint, step_index)`, which is what makes
+registering idempotent. Indexes: a partial index on pending approvals (`requested_at, approval_id`)
+and `(incident_id, status)`. The migration also re-creates `chk_incidents_status` to admit the new
+`awaiting_approval` status. It is re-runnable: `IF NOT EXISTS` on the table and indexes, and
+drop-then-add on the constraint.
+
+**Why there is no foreign key to the remediation rows** (the spec asked for the exact step to be
+preserved). `save_incident` deletes and re-inserts `incident_remediations` on every save, so their ids
+are not stable: a foreign key would either cascade-delete the audit trail or block the re-save. An
+approval instead identifies its step by plan fingerprint + step index + step fingerprint, and keeps
+a snapshot of what the approver was shown. `ON DELETE RESTRICT` (not `CASCADE`) so an incident with
+approval history cannot be deleted from under it.
+
+**Identity of an approval (`domain/approvals.py`, pure).** The plan fingerprint is a hash of the
+ordered `(action_type, target_service)` pairs; the step fingerprint hashes one such pair. The model's
+rationale prose is deliberately *excluded*: it differs on every run, and including it would make a
+decision unusable after any re-plan. Consequences, all tested: re-planning to the same actions reuses
+a decision; a changed, reordered, lengthened or shortened plan does not; approving step 1 never
+authorizes step 2; an approval never transfers to a different action.
+
+**Enforcement (`workflows/incident.py`, `execute_remediation_node`).** Stored decisions are folded onto
+the freshly guarded plan immediately before `execute_guarded_plan`, using the existing
+`GuardedPlan.approve()/reject()`. Only a step still `REQUIRES_APPROVAL` and pending is touched, and only
+by an approval matching plan, position, action and target. A guardrail-`BLOCKED` step stays blocked
+whatever was approved (a weak analysis raises HIGH to CRITICAL, so an earlier approval cannot
+override it). The executor is unchanged and still re-checks every step itself. The node returns the
+decision-applied plan so persistence sees the plan as executed. **If the approval lookup fails the
+workflow fails closed** (steps stay unexecuted, `approval_lookup_error` is set), so an outage can never
+widen what runs. With no approval repository (CLI, evaluation) behaviour is exactly as before.
+
+**Decision rules (`ApprovalRepository.decide_approval`, both backends).** Checked in this order inside
+one lock or transaction: arguments valid (outcome approved/rejected, approver non-blank; `ValueError`),
+incident exists (404), approval exists *for that incident* (404; another incident's approval id is
+indistinguishable from a missing one), still pending (a second decision is **409**, even repeating the
+same one; the first decision, its approver and its timestamp are permanent), incident still open
+(409 once resolved, escalated, monitored or closed), plan not superseded (409). PostgreSQL takes
+`FOR SHARE` on the incident row (which blocks a concurrent re-save from replacing the plan between the
+check and the write) and `FOR UPDATE` on the approval row (which serializes competing decisions: the
+loser waits, re-reads the winner's committed row and fails the pending check), then writes with
+`UPDATE ... WHERE status = 'pending'` and treats an unexpected row count as a conflict.
+
+**Lifecycle change: `awaiting_approval`.** A run that escalates while a step still waits for a human
+is no longer terminal `escalated`; it is the non-terminal `awaiting_approval`, otherwise a resubmission
+after approval would collide with the terminal-record rule. A rejected step makes the run terminal
+`escalated`; a run that resolves is `resolved` even if another step was left pending. `final_outcome`,
+and so the API's `outcome`, is unchanged (`escalate`).
+
+**API.** `GET /incidents/{id}/approvals` (optional `?status=pending|approved|rejected`, 422 otherwise),
+`POST /incidents/{id}/approvals/{approval_id}/approve` and `.../reject` with body `{"approver": str
+(1-128, trimmed), "reason": str|null (<=1000)}` and no extra fields. Responses carry the step snapshot,
+timestamps, approver, reason, and two computed hints: `stale` (the incident's plan no longer matches)
+and `decidable` (a decision would be accepted now). 404 / 409 / 422 as above; any storage failure is
+503 with a generic message that leaks nothing. If the decision committed but the follow-up read fails,
+the response is still 200 with `stale`/`decidable` `null`. `POST /incidents` gains `pending_approval_ids`,
+and `persisted` now means the record **and** its approvals were written.
+
+**Partial failure, made explicit (`persistence/runs.py`).** Saving the record and registering approvals
+are two transactions, in that order (approvals reference the record). If the record fails, nothing is
+registered. If registration fails after the record saved, `persisted` is `false` with an error that says
+so; resubmitting the same incident repairs it, because registration is idempotent and never resets a
+decision. Approvals are registered only while the incident is open.
+
+**Authentication: not provided.** There is no authentication in this service, so `approver` is a
+caller-supplied label and anyone who can reach the endpoint can claim any name. It is recorded for the
+audit trail, every response carries `approver_verified: false`, and the OpenAPI text for the decision
+endpoints says "NOT authenticated". Do not rely on it as authorization.
+
+**Verified, and how.**
+- Baseline before the change: 493 passed, 3 skipped (no database); 496 passed (with PostgreSQL).
+- After: **630 passed, 92 skipped without a database; 722 passed, 0 skipped with one.** The 89 new
+  skips are the PostgreSQL legs of the new tests. `ruff check` and `ruff format --check` clean (94 files).
+- PostgreSQL legs ran against an **embedded PostgreSQL 16.2** (`pgserver`, Windows; a throwaway
+  environment, not a project dependency): the repository contract on both backends, an 8-thread
+  race with real connections (exactly one winner), the check/unique/foreign-key constraints
+  rejecting bad rows, `RESTRICT` blocking deletion, the partial index being chosen by `EXPLAIN`
+  with sequential scans off, and migration 002 running twice without error. The workflow and HTTP
+  tests (via `TestClient`) also ran against PostgreSQL.
+- **Mutation check on the enforcement point:** disabling it fails 6 workflow tests; loosening it to ignore
+  plan identity fails the three safety tests (neighbour approval, replaced plan, same step in a longer
+  plan). So the tests do detect a broken boundary.
+- Planner, guardrails, executor and verification are real in the workflow and API tests; only severity,
+  investigation and RCA are stubbed and the planner's LLM client is a fake returning real JSON.
+- A test that assumed 001 was the only migration was corrected, and a test for upgrading a
+  database that only has 001 was added.
+
+**Not verified.** The GitHub Actions run (the workflow's `postgres:16` service now also runs these
+legs, unconfirmed). Any PostgreSQL other than that embedded 16.2 build. A real `uvicorn` server (HTTP
+tests used `TestClient`). The live-LLM path: the live test was not run (and currently fails upstream, see
+below), so no external quota was spent.
+
+**Known limitations.**
+- **Approver identity is unauthenticated** (above). Decisions are not tied to a person.
+- **Applying a decision means resubmitting the incident, which re-plans.** The planner is an LLM, so a
+  resubmission can propose a different plan; the old approval then no longer matches and a fresh one
+  is requested (visible as `stale`). That is the intended safety property, but it makes the loop
+  awkward. A dedicated "execute the approved plan" operation that reuses the stored plan, rather than
+  re-planning, would be the natural fix and is not built.
+- Nobody is notified that an approval is waiting; there is no HTTP route for the cross-incident pending
+  queue (`list_pending_approvals` exists on both repositories and is tested, but is not exposed).
+- Superseded approvals stay `pending` for ever (the spec allows three statuses only); they are flagged
+  `stale` and cannot be decided. Likewise a step left pending when its incident resolves.
+- A resubmitted incident with a terminal record and a different outcome is still a conflict and is
+  reported as `persisted: false`.
+- Remediation is still simulated, and the post-remediation world is still an injected scenario, so an
+  approved step "recovering" the service is a property of that parameter (Phase 12 gap, unchanged).
+- Retrying a failed persistence step is manual (resubmit); there is no automatic retry, by design.
+
+---
+
 ### Hardening — understanding and surfacing the OpenRouter rate limit properly ✅
 
 **Goal:** the free-tier 429 had been hit twice (Phase 5.6, Phase 7) and left as an open known issue
@@ -1664,8 +1794,8 @@ hours.
 
 ## 5. Current State
 
-**Test suite: 493 passed, 3 skipped without a database; 496 passed with `DATABASE_URL` set.** The
-three skips are the live-PostgreSQL tests. `test_assess_severity_live` is deselected in these runs:
+**Test suite: 630 passed, 92 skipped without a database; 722 passed, 0 skipped with `DATABASE_URL`
+set.** The skips are the PostgreSQL legs (89 of them from the approval tests, run once per backend). `test_assess_severity_live` is deselected in these runs:
 it now skips without an OpenRouter key, and with one it currently fails (see Known Issues).
 Everything else is deterministic: the knowledge tests load a real local embedding
 model but no LLM, the OpenRouter provider tests mock HTTP, and the evaluation harness stubs the LLM
@@ -1682,6 +1812,7 @@ src/agentic_ai/
 │   ├── remediation.py       Action types, risk tiers, plan, execution results
 │   ├── guardrails.py        Tier policy, GuardedPlan, approve()/reject()
 │   ├── verification.py      VerificationStatus, evaluate_verification()
+│   ├── approvals.py         ApprovalRecord, fingerprints, decide(), apply_persisted_decisions()
 │   ├── summaries.py         DiagnosticSummary, VerificationSummary
 │   └── persistence.py       Incident run records and their mapping from workflow state
 ├── llm/                     client + providers (OpenRouter default, Ollama), severity, rca,
@@ -1698,9 +1829,11 @@ src/agentic_ai/
 ├── mcp_server/server.py     Read-only MCP server over the investigation tools
 ├── evaluation/              9 golden cases, runner, metrics, invariants
 ├── observability/           Tracer, trace models, redaction
-├── persistence/             Repository protocol, in-memory and PostgreSQL repos, factory,
-│                            migrator, `migrate` command, SQL migration
-├── api/                     FastAPI: /health, /ready, POST /incidents, GET /incidents/{id}
+├── persistence/             Repository protocols (incidents + approvals), in-memory and
+│                            PostgreSQL repos, factory, run persistence, migrator, `migrate`
+│                            command, SQL migrations 001-002
+├── api/                     FastAPI: /health, /ready, POST /incidents, GET /incidents/{id},
+│                            GET .../approvals, POST .../approvals/{id}/approve|reject
 ├── config.py                Validated settings
 └── cli.py                   agentic-ai-demo
 ```
@@ -1723,14 +1856,15 @@ src/agentic_ai/
 | LLM calls for severity, investigation, RCA, planning | Observability tools (fixed fixtures) |
 | Deterministic escalation, guardrails, verification logic | Remediation execution (returns text only) |
 | Local embedding retrieval, JSONL memory | Post-remediation health (an injected scenario) |
-| MCP server, FastAPI service | Persistence is real but only verified on one embedded PostgreSQL build |
+| MCP server, FastAPI service | Persistence and approvals are real but only verified on one embedded PostgreSQL build |
+| Human approval of HIGH-risk steps, enforced before execution | The approver's identity is an unauthenticated label |
 | Incident persistence to PostgreSQL | Falls back to in-memory (not durable) without `DATABASE_URL` |
 
 **Commit index:** Phases 1-7 and the rate-limit hardening, up to `dc31bc1` (pushed) · Phase 7b and 8 `c59edc6` · Phase 9 `3f1807c` ·
 Phase 10 `b3b2b75` · CI fix `d39079a`, `12e67b8` · Phase 16b `eaad8fd`, `9bbb696`, `56813a4`, `7d3dcb3` · Phase 11 `0397465` · Phase 12 `b5fd76d` · Phase 14 `73f5e20` · workflow
 integration `6fcf672` · Phase 13 `14a42cb` · Phase 15 `52e2a5e`, `b5078b8` · Phase 16 `a0c22a2` ·
-README `d1b7de2`. Everything after `dc31bc1` is committed locally and not pushed (`main` is 20
-commits ahead of `origin/main`).
+README `d1b7de2` · Phase 17 approval API. Everything after `dc31bc1` is
+committed locally and not pushed.
 
 ---
 
@@ -1743,14 +1877,19 @@ commits ahead of `origin/main`).
 | `TimelineEntry.event_type` | Not built | Must be an **enum**, not free text |
 | `workflows/` vs `agents/` boundary | Provisional | Held up so far: the workflow node *calls* the agent rather than embedding it. Will be tested again in Phase 7 by the Supervisor |
 | `escalate` / `monitor` / `resolve` take no action | Open | They record `next_step` and a trace outcome. Nothing is paged, ticketed or closed. Remediation exists (Phase 11) but is simulated |
-| No way to approve a HIGH-risk step | **Open, most important gap** | `GuardedPlan.approve()` exists and the executor honours it, but no API route, CLI command or queue calls it. HIGH steps stay PENDING, are always skipped, and verification then reports SKIPPED |
+| No way to approve a HIGH-risk step | Resolved (Phase 17) | Persisted approvals, three endpoints, enforced at the execution boundary |
+| Approver identity is not authenticated | **Open, most important gap** | `approver` is a caller-supplied label; anyone who can reach the API can claim any name. Recorded as `approver_verified: false`. Needs authentication before approvals can be treated as authorization |
+| Applying a decision requires resubmitting, which re-plans | Open | The LLM planner may propose a different plan, which makes the old approval stale. A "run the approved plan as stored" operation is the fix and is not built |
+| No notification, no HTTP route for the pending queue | Open | `list_pending_approvals` exists and is tested on both repositories, but nothing exposes it and nobody is told an approval is waiting |
+| Superseded approvals stay pending | Open, by design | Only three statuses are allowed. They are flagged `stale` and cannot be decided; likewise a step left pending when its incident resolves |
+| Record and approvals are saved in two transactions | Open, explicit | A failure between them is reported as `persisted: false`; resubmitting repairs it (registration is idempotent) |
 | Verification is injected, not causal | Open | RECOVERED depends on the `post_remediation_scenario` argument (API default `HEALTHY`); the mock executor changes nothing. No retry or re-investigation loop although `MAX_VERIFICATION_ATTEMPTS = 2` exists |
 | CI fails on the live-LLM test | Resolved | The test skips without a key and has a `live` marker (`12e67b8`) |
 | `ruff format --check` covers a hand-picked file list | Resolved | Now `ruff format --check .` after a mechanical reformat (`d39079a`) |
 | Default OpenRouter model returns 404 | **Open, blocks live use** | `nvidia/nemotron-3-super-120b-a12b:free` is still listed but the upstream provider answers `Function '...': Not found for account`. Live runs and the app's default model fail until another free model is chosen, which also spends the 50 requests/day quota |
-| CI's PostgreSQL service not yet exercised | Open | The workflow adds `postgres:16` and `DATABASE_URL`; GitHub Actions was not run, so whether the live tests pass there is unconfirmed |
+| CI's PostgreSQL service not yet exercised | Open | The workflow adds `postgres:16` and `DATABASE_URL`, so the approval PostgreSQL legs would run there; GitHub Actions was not run, so whether they pass there is unconfirmed |
 | Docker image never built or run | Open | Image size unmeasured; `sentence-transformers` is a heavy dependency; memory directory is not a volume |
-| Postgres verified on one build only | Partly resolved | Migrations and the repository pass against an embedded PostgreSQL 16.2 (`pgserver`, Windows). Not run on Docker, a managed service, or other versions |
+| Postgres verified on one build only | Partly resolved | Migrations 001-002, the repository and the approval flow pass against an embedded PostgreSQL 16.2 (`pgserver`, Windows), including a threaded race and the constraints. Not run on Docker, a managed service, or other versions |
 | Persistence unconnected | Resolved for the API | `POST /incidents` saves and `GET /incidents/{id}` reads (`56813a4`). The workflow itself, the CLI and the evaluation runner do not write to a repository |
 | `domain/persistence.py` imports `api.schemas` | Resolved | Summaries moved to `domain/summaries.py` (`eaad8fd`) |
 | Re-saving an incident overwrites `created_at` | Open, by parity | Both repositories do it. `POST /incidents` rebuilds the record each time, so resubmitting an `incident_id` rewrites its `created_at` |
@@ -1760,7 +1899,7 @@ commits ahead of `origin/main`).
 | Learned memory can record simulated success as fact | Open | An entry can read "Recovery: verified recovered" for a remediation that did nothing. Still `learned` and unverified at retrieval |
 | API has no auth, rate limiting or async handling | Open | `POST /incidents` runs the whole workflow, including LLM calls, synchronously in the handler |
 | Evaluation measures the pipeline, not the model | Open | 9 golden cases with stubbed LLM steps; nothing scores live-model narrative accuracy or tracks regression |
-| Nothing after `dc31bc1` is pushed | Open | `main` is 20 commits ahead of `origin/main` |
+| Nothing after `dc31bc1` is pushed | Open | `main` is ahead of `origin/main` |
 | `AVAILABLE_SERVICES` mutability | Minor | `list` → `tuple` would prevent accidental mutation |
 | Linter / formatter | Resolved (partly) | `ruff` configured and lint passes; see the format-check gap above |
 | Git author identity | Unconfigured | Commits carry an auto-guessed name/email on a public repo |
@@ -1796,7 +1935,8 @@ commits ahead of `origin/main`).
 | 14 | Observability — spans, JSON logs, redaction; no token counts, no trace retrieval | 🚧 |
 | 15 | Production — API, config, CLI, Docker, CI done; Docker unbuilt, CI has a defect; K8s, AWS, Terraform not started | 🚧 |
 | 16 | Persistence — PostgreSQL repository, migrations, API saves and reads runs; verified on one embedded build, not in CI yet; workflow/CLI do not write | 🚧 |
-| — | **Approval surface** (route or CLI to approve/reject pending steps), now able to build on persistence | ⬜ next |
+| 17 | Approval API — persisted approvals, approve/reject/list endpoints, enforced before execution; approver unauthenticated | ✅ |
+| — | **Next:** authentication for the approver; a "run the approved plan as stored" operation (no re-planning); expose the pending queue; commit and push | ⬜ |
 
 **Guardrail model, implemented in Phase 10:**
 
@@ -1906,3 +2046,10 @@ Extracted from decisions actually made in this project, not aspirational:
 34. **A fake can prove your logic and nothing about your SQL.** The fake-connection tests accept any
     string; only a run against a real server shows the SQL is valid. Say which evidence is which, and
     run the real one before calling persistence done.
+35. **An approval is a statement about a specific thing, so identify the thing.** A boolean on a
+    plan authorizes whatever the plan later becomes. The approval is bound to the ordered plan, the
+    position and the action, and excludes the one field (the model's prose) that is expected to
+    change, so a re-plan to the same actions keeps a decision and any other change loses it.
+36. **A test suite that passes first time has not yet shown it can fail.** The approval tests went
+    green immediately, so the enforcement point was broken on purpose two ways to see which tests
+    noticed. Disabling it failed six; loosening it failed exactly the three safety tests.

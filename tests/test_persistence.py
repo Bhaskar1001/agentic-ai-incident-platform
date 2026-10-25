@@ -492,3 +492,57 @@ def test_from_workflow_state_maps_a_real_guarded_plan_and_execution() -> None:
     # HIGH risk and unapproved: skipped, with its disposition preserved.
     assert record.remediations[1].execution_status == "skipped"
     assert record.remediations[1].disposition == "requires_approval"
+
+
+# --- awaiting_approval -------------------------------------------------------------------
+
+
+def _run_state(*actions, outcome, decide=None):
+    from agentic_ai.tools.mock_remediation import execute_guarded_plan
+    from tests.approval_helpers import guarded
+
+    plan = guarded(*actions)
+    if decide is not None:
+        plan = decide(plan)
+    return {
+        "incident_id": "INC-S",
+        "incident_description": "d",
+        "guarded_plan": plan,
+        "remediation_execution": execute_guarded_plan(plan),
+        "next_step": outcome,
+    }
+
+
+def test_an_escalated_run_with_a_step_still_waiting_is_open_not_terminal() -> None:
+    from tests.approval_helpers import HIGH_ROLLBACK
+
+    record = IncidentRecord.from_workflow_state(_run_state(HIGH_ROLLBACK, outcome="escalate"))
+
+    assert record.status == IncidentLifecycleStatus.AWAITING_APPROVAL
+    assert not record.status.is_terminal
+    assert record.final_outcome == "escalate"  # the API outcome is unchanged
+    assert record.resolved_at is None
+
+
+def test_an_escalated_run_whose_step_was_rejected_is_terminal() -> None:
+    from tests.approval_helpers import HIGH_ROLLBACK
+
+    state = _run_state(HIGH_ROLLBACK, outcome="escalate", decide=lambda p: p.reject(0, "bob"))
+    record = IncidentRecord.from_workflow_state(state)
+
+    assert record.status == IncidentLifecycleStatus.ESCALATED and record.status.is_terminal
+
+
+def test_an_escalated_run_with_nothing_waiting_is_escalated() -> None:
+    from tests.approval_helpers import LOW
+
+    record = IncidentRecord.from_workflow_state(_run_state(LOW, outcome="escalate"))
+    assert record.status == IncidentLifecycleStatus.ESCALATED
+
+
+def test_a_resolved_run_is_resolved_even_if_a_step_was_left_pending() -> None:
+    from tests.approval_helpers import HIGH_ROLLBACK, LOW
+
+    record = IncidentRecord.from_workflow_state(_run_state(LOW, HIGH_ROLLBACK, outcome="resolve"))
+
+    assert record.status == IncidentLifecycleStatus.RESOLVED and record.status.is_terminal

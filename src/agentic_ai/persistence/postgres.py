@@ -21,9 +21,17 @@ test in ``tests/test_postgres_repository.py``.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
+from agentic_ai.domain.approvals import (
+    ApprovalDecisionError,
+    ApprovalRecord,
+    check_decidable,
+    decide,
+    validate_decision_inputs,
+)
+from agentic_ai.domain.guardrails import ApprovalState
 from agentic_ai.domain.incident import Severity
 from agentic_ai.domain.persistence import (
     IncidentLifecycleStatus,
@@ -33,7 +41,10 @@ from agentic_ai.domain.persistence import (
 )
 from agentic_ai.domain.summaries import DiagnosticSummary, VerificationSummary
 from agentic_ai.persistence.repository import (
+    ApprovalConflictError,
+    ApprovalNotFoundError,
     IncidentConflictError,
+    IncidentNotFoundError,
     IncidentPersistenceError,
 )
 
@@ -81,6 +92,23 @@ VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
 """
 
 _SELECT_ORDER = "ORDER BY created_at DESC, incident_id DESC"
+
+_APPROVAL_COLUMNS = (
+    "approval_id, incident_id, plan_fingerprint, step_index, step_fingerprint, "
+    "action_type, target_service, rationale, status, requested_at, decided_at, "
+    "approver, decision_reason"
+)
+
+_INSERT_APPROVAL = f"""
+INSERT INTO incident_approvals ({_APPROVAL_COLUMNS})
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+ON CONFLICT (incident_id, plan_fingerprint, step_index) DO NOTHING
+"""
+
+# Per incident: oldest first, steps of one plan in order. The global queue has no
+# step_index in its ordering so that it matches the partial index exactly.
+_APPROVAL_ORDER = "ORDER BY requested_at, step_index, approval_id"
+_PENDING_QUEUE_ORDER = "ORDER BY requested_at, approval_id"
 
 
 def _json_value(value: Any) -> Any:
@@ -267,6 +295,192 @@ class PostgresIncidentRepository:
 
         return self._in_transaction(work)
 
+    # -- approvals ------------------------------------------------------------
+
+    def request_approvals(self, approvals: Sequence[ApprovalRecord]) -> list[ApprovalRecord]:
+        def work(cur: Any) -> list[ApprovalRecord]:
+            stored: list[ApprovalRecord] = []
+            for approval in approvals:
+                # KEY SHARE: the incident cannot be deleted while we attach to it.
+                cur.execute(
+                    "SELECT 1 FROM incidents WHERE incident_id = %s FOR KEY SHARE",
+                    (approval.incident_id,),
+                )
+                if cur.fetchone() is None:
+                    raise IncidentNotFoundError(approval.incident_id)
+
+                cur.execute(
+                    _INSERT_APPROVAL,
+                    (
+                        approval.approval_id,
+                        approval.incident_id,
+                        approval.plan_fingerprint,
+                        approval.step_index,
+                        approval.step_fingerprint,
+                        approval.action_type,
+                        approval.target_service,
+                        approval.rationale,
+                        approval.status.value,
+                        approval.requested_at,
+                        approval.decided_at,
+                        approval.approver,
+                        approval.decision_reason,
+                    ),
+                )
+                # Re-read: if the step already had an approval, that one wins untouched.
+                cur.execute(
+                    f"SELECT {_APPROVAL_COLUMNS} FROM incident_approvals "
+                    "WHERE incident_id = %s AND plan_fingerprint = %s AND step_index = %s",
+                    (approval.incident_id, approval.plan_fingerprint, approval.step_index),
+                )
+                stored.append(self._row_to_approval(cur.fetchone()))
+            return stored
+
+        return self._in_transaction(work)
+
+    def get_approval(self, incident_id: str, approval_id: str) -> ApprovalRecord | None:
+        def work(cur: Any) -> ApprovalRecord | None:
+            cur.execute(
+                f"SELECT {_APPROVAL_COLUMNS} FROM incident_approvals "
+                "WHERE approval_id = %s AND incident_id = %s",
+                (approval_id, incident_id),
+            )
+            row = cur.fetchone()
+            return None if row is None else self._row_to_approval(row)
+
+        return self._in_transaction(work)
+
+    def list_approvals(
+        self, incident_id: str, status: ApprovalState | None = None
+    ) -> list[ApprovalRecord]:
+        def work(cur: Any) -> list[ApprovalRecord]:
+            if status is None:
+                cur.execute(
+                    f"SELECT {_APPROVAL_COLUMNS} FROM incident_approvals "
+                    f"WHERE incident_id = %s {_APPROVAL_ORDER}",
+                    (incident_id,),
+                )
+            else:
+                cur.execute(
+                    f"SELECT {_APPROVAL_COLUMNS} FROM incident_approvals "
+                    f"WHERE incident_id = %s AND status = %s {_APPROVAL_ORDER}",
+                    (incident_id, status.value),
+                )
+            return [self._row_to_approval(r) for r in cur.fetchall()]
+
+        return self._in_transaction(work)
+
+    def list_pending_approvals(self, limit: int = 50) -> list[ApprovalRecord]:
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit}")
+
+        def work(cur: Any) -> list[ApprovalRecord]:
+            cur.execute(
+                f"SELECT {_APPROVAL_COLUMNS} FROM incident_approvals "
+                f"WHERE status = 'pending' {_PENDING_QUEUE_ORDER} LIMIT %s",
+                (limit,),
+            )
+            return [self._row_to_approval(r) for r in cur.fetchall()]
+
+        return self._in_transaction(work)
+
+    def decide_approval(
+        self,
+        incident_id: str,
+        approval_id: str,
+        outcome: ApprovalState,
+        approver: str,
+        reason: str | None = None,
+    ) -> ApprovalRecord:
+        validate_decision_inputs(outcome, approver)
+
+        def work(cur: Any) -> ApprovalRecord:
+            # FOR SHARE on the incident blocks a concurrent save_incident (which takes
+            # FOR UPDATE on the same row), so the plan we check cannot be replaced
+            # before our write commits. Concurrent decisions share this lock freely.
+            cur.execute(
+                "SELECT status FROM incidents WHERE incident_id = %s FOR SHARE",
+                (incident_id,),
+            )
+            incident_row = cur.fetchone()
+            if incident_row is None:
+                raise IncidentNotFoundError(incident_id)
+
+            # FOR UPDATE serializes competing decisions: the loser waits, then re-reads
+            # the winner's committed row and fails the pending check below.
+            cur.execute(
+                f"SELECT {_APPROVAL_COLUMNS} FROM incident_approvals "
+                "WHERE approval_id = %s AND incident_id = %s FOR UPDATE",
+                (approval_id, incident_id),
+            )
+            approval_row = cur.fetchone()
+            if approval_row is None:
+                raise ApprovalNotFoundError(incident_id, approval_id)
+            approval = self._row_to_approval(approval_row)
+
+            cur.execute(
+                "SELECT step_order, action_type, target_service, disposition, "
+                "execution_status, parameters, output FROM incident_remediations "
+                "WHERE incident_id = %s ORDER BY step_order",
+                (incident_id,),
+            )
+            remediations = [
+                IncidentRemediationRecord(
+                    step_order=r[0],
+                    action_type=r[1],
+                    target_service=r[2],
+                    disposition=r[3],
+                    execution_status=r[4],
+                    parameters=_json_value(r[5]) or {},
+                    output=r[6],
+                )
+                for r in cur.fetchall()
+            ]
+
+            try:
+                check_decidable(approval, IncidentLifecycleStatus(incident_row[0]), remediations)
+                decided = decide(approval, outcome, approver, reason)
+            except ApprovalDecisionError as exc:
+                raise ApprovalConflictError(str(exc)) from exc
+
+            # Conditional on still being pending: a second line of defence behind the lock.
+            cur.execute(
+                "UPDATE incident_approvals SET status = %s, decided_at = %s, approver = %s, "
+                "decision_reason = %s WHERE approval_id = %s AND status = 'pending'",
+                (
+                    decided.status.value,
+                    decided.decided_at,
+                    decided.approver,
+                    decided.decision_reason,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ApprovalConflictError(
+                    f"Approval '{approval_id}' was decided by a concurrent request."
+                )
+            return decided
+
+        return self._in_transaction(work)
+
+    @staticmethod
+    def _row_to_approval(row: Any) -> ApprovalRecord:
+        return ApprovalRecord(
+            approval_id=row[0],
+            incident_id=row[1],
+            plan_fingerprint=row[2],
+            step_index=row[3],
+            step_fingerprint=row[4],
+            action_type=row[5],
+            target_service=row[6],
+            rationale=row[7],
+            status=ApprovalState(row[8]),
+            requested_at=row[9],
+            decided_at=row[10],
+            approver=row[11],
+            decision_reason=row[12],
+        )
+
     # -- internals ------------------------------------------------------------
 
     def _in_transaction(self, work: Callable[[Any], Any]) -> Any:
@@ -285,7 +499,9 @@ class PostgresIncidentRepository:
                 cursor.close()
             connection.commit()
             return result
-        except (IncidentConflictError, ValueError):
+        except (IncidentPersistenceError, ValueError):
+            # Domain outcomes (conflict, not found) and bad arguments are not driver
+            # failures: roll back and let the caller see them as they are.
             connection.rollback()
             raise
         except Exception as exc:

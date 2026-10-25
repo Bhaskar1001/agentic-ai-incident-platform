@@ -18,6 +18,7 @@ from raw evidence before RCA exists, the same principle that keeps the
 escalation policy reading tool output rather than an LLM's narrative about it.
 """
 
+import logging
 from contextlib import contextmanager
 from typing import Any, Generator, Literal, TypedDict
 from uuid import uuid4
@@ -25,6 +26,7 @@ from uuid import uuid4
 from langgraph.graph import END, START, StateGraph
 
 from agentic_ai.agents.investigation import InvestigationError, investigate
+from agentic_ai.domain.approvals import apply_persisted_decisions
 from agentic_ai.domain.escalation import evaluate
 from agentic_ai.domain.guardrails import Disposition, GuardedPlan, guard_plan
 from agentic_ai.domain.incident import Severity
@@ -45,12 +47,15 @@ from agentic_ai.observability.events import (
     IncidentTrace,
 )
 from agentic_ai.observability.tracer import OperationalTracer
+from agentic_ai.persistence.repository import ApprovalRepository
 from agentic_ai.tools.incident_memory import remember
 from agentic_ai.tools.mock_remediation import execute_guarded_plan
 from agentic_ai.tools.mock_tools import DEFAULT_SCENARIO, Scenario
 from agentic_ai.tools.mock_verification import verify_service_health
 
 ESCALATION_SEVERITIES = frozenset({Severity.HIGH, Severity.CRITICAL})
+
+logger = logging.getLogger("agentic_ai.workflow")
 
 
 class IncidentWorkflowState(TypedDict):
@@ -75,6 +80,8 @@ class IncidentWorkflowState(TypedDict):
     guarded_plan: GuardedPlan | None
     remediation_execution: RemediationExecution | None
     verification: VerificationResult | None
+    approval_repository: ApprovalRepository | None
+    approval_lookup_error: str | None
     memory_recorded: bool
     next_step: str | None
     incident_id: str | None
@@ -389,6 +396,37 @@ def apply_guardrails_node(state: IncidentWorkflowState) -> dict[str, GuardedPlan
         return {"guarded_plan": guard_plan(plan, analysis, investigated)}
 
 
+def _apply_stored_approvals(
+    state: IncidentWorkflowState, guarded: GuardedPlan
+) -> tuple[GuardedPlan, str | None]:
+    """Apply persisted approve/reject decisions to ``guarded``; fail closed on error.
+
+    With no approval repository (CLI, evaluation, tests) or no incident id the plan
+    is returned untouched, which is the pre-approval behaviour: steps awaiting a
+    human stay unexecuted. If the lookup itself fails, the same happens and the
+    failure is reported, never swallowed into "approved": an unreachable approval
+    store must not be able to widen what executes.
+    """
+    repository = state.get("approval_repository")
+    incident_id = state.get("incident_id")
+    if repository is None or incident_id is None:
+        return guarded, None
+
+    try:
+        approvals = repository.list_approvals(incident_id)
+    except Exception as exc:
+        logger.warning(
+            "Approval lookup failed (%s); steps awaiting approval stay unexecuted.",
+            type(exc).__name__,
+        )
+        return guarded, (
+            f"approval lookup failed ({type(exc).__name__}); "
+            "steps awaiting approval were left unexecuted"
+        )
+
+    return apply_persisted_decisions(guarded, approvals), None
+
+
 def execute_remediation_node(
     state: IncidentWorkflowState,
 ) -> dict[str, RemediationExecution | None]:
@@ -402,6 +440,11 @@ def execute_remediation_node(
         guarded = state["guarded_plan"]
         if guarded is None:
             return {"remediation_execution": None}
+
+        # The enforcement point. Stored human decisions are folded back onto the
+        # freshly guarded plan *here*, immediately before the executor sees it, so an
+        # approval only ever counts if it matches an exact step of this exact plan.
+        guarded, lookup_error = _apply_stored_approvals(state, guarded)
 
         execution = execute_guarded_plan(guarded)
 
@@ -447,7 +490,12 @@ def execute_remediation_node(
             except Exception:
                 pass
 
-        return {"remediation_execution": execution}
+        return {
+            "remediation_execution": execution,
+            # Downstream (persistence, tracing) must see the plan as it was executed.
+            "guarded_plan": guarded,
+            "approval_lookup_error": lookup_error,
+        }
 
 
 def verify_remediation_node(
@@ -715,6 +763,7 @@ def handle_incident(
     incident_id: str | None = None,
     correlation_id: str | None = None,
     tracer: OperationalTracer | None = None,
+    approval_repository: ApprovalRepository | None = None,
 ) -> IncidentWorkflowState:
     """Run one incident through the full workflow with operational tracing."""
     effective_incident_id = incident_id or (
@@ -747,6 +796,8 @@ def handle_incident(
             "guarded_plan": None,
             "remediation_execution": None,
             "verification": None,
+            "approval_repository": approval_repository,
+            "approval_lookup_error": None,
             "memory_recorded": False,
             "next_step": None,
             "incident_id": effective_incident_id,

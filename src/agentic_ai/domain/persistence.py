@@ -34,6 +34,11 @@ class IncidentLifecycleStatus(str, Enum):
     MITIGATION = "mitigation"
     """Root cause established; remediation plan being guarded or executed."""
 
+    AWAITING_APPROVAL = "awaiting_approval"
+    """A run escalated while a high-risk step still waits for a human decision.
+    Deliberately non-terminal: once the decision is made, a rerun of the same
+    incident may execute the step and move the record to a terminal state."""
+
     RESOLVED = "resolved"
     """Remediation executed and service recovery verified."""
 
@@ -55,6 +60,16 @@ class IncidentLifecycleStatus(str, Enum):
             IncidentLifecycleStatus.MONITORED,
             IncidentLifecycleStatus.CLOSED,
         )
+
+
+def _has_pending_approval(guarded_plan: Any) -> bool:
+    """True if any step still waits on a human (works on real or stand-in plans)."""
+    for g_step in getattr(guarded_plan, "steps", None) or []:
+        disposition = getattr(getattr(g_step, "disposition", None), "value", None)
+        approval = getattr(getattr(g_step, "approval", None), "value", None)
+        if disposition == "requires_approval" and approval == "pending":
+            return True
+    return False
 
 
 class IncidentStageRecord(BaseModel):
@@ -162,7 +177,11 @@ class IncidentRecord(BaseModel):
         if final_outcome == "resolve":
             status = IncidentLifecycleStatus.RESOLVED
         elif final_outcome == "escalate":
-            status = IncidentLifecycleStatus.ESCALATED
+            status = (
+                IncidentLifecycleStatus.AWAITING_APPROVAL
+                if _has_pending_approval(state.get("guarded_plan"))
+                else IncidentLifecycleStatus.ESCALATED
+            )
         elif final_outcome == "monitor":
             status = IncidentLifecycleStatus.MONITORED
         elif (

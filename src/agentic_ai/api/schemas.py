@@ -9,6 +9,8 @@ Defines typed request and response contracts for:
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agentic_ai.observability.events import IncidentTrace
@@ -93,8 +95,12 @@ class IncidentResponse(BaseModel):
     verification: VerificationSummary | None = None
     trace: IncidentTrace | None = None
     persisted: bool = False
-    """Whether this run was written to the incident repository. False means the
-    result is valid but the audit record was not saved (see the server logs)."""
+    """Whether this run was fully written: the incident record and, if any step is
+    waiting on a human, its pending approvals. False means the result is valid but
+    something was not saved (see the server logs); it never means a retry happened."""
+    pending_approval_ids: list[str] = Field(default_factory=list)
+    """Approvals this run is waiting on. Decide them through the approvals endpoints,
+    then resubmit the same incident_id so the workflow can act on the decision."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -105,5 +111,68 @@ class ErrorResponse(BaseModel):
     detail: str
     incident_id: str | None = None
     correlation_id: str | None = None
+
+    model_config = ConfigDict(frozen=True)
+
+
+class ApprovalDecisionRequest(BaseModel):
+    """A human decision on one pending approval.
+
+    ``approver`` is a free-text label supplied by the caller. **It is not an
+    authenticated identity**: this service has no authentication, so anyone who can
+    reach the endpoint can claim any name. It is recorded for the audit trail as
+    provisional, and the response says so (``approver_verified: false``).
+    """
+
+    approver: str = Field(min_length=1, max_length=128)
+    reason: str | None = Field(default=None, max_length=1000)
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    @field_validator("approver")
+    @classmethod
+    def _approver_not_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("approver must not be blank.")
+        return cleaned
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_cleaned(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
+
+
+class ApprovalResponse(BaseModel):
+    """One approval, with what it authorizes and how it was decided."""
+
+    approval_id: str
+    incident_id: str
+    step_index: int
+    action_type: str
+    target_service: str
+    rationale: str
+    status: str  # "pending", "approved", "rejected"
+    requested_at: datetime
+    decided_at: datetime | None = None
+    approver: str | None = None
+    decision_reason: str | None = None
+    approver_verified: bool = False
+    """Always False: the approver name is caller-supplied and unauthenticated."""
+    stale: bool | None = None
+    """True if the incident's stored plan no longer matches this approval (the plan
+    was replaced), so it can never authorize anything. None if it could not be checked."""
+    decidable: bool | None = None
+    """True only if a decision would be accepted right now. None if it could not be checked."""
+
+    model_config = ConfigDict(frozen=True)
+
+
+class ApprovalListResponse(BaseModel):
+    incident_id: str
+    approvals: list[ApprovalResponse]
 
     model_config = ConfigDict(frozen=True)

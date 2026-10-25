@@ -6,18 +6,24 @@ Exposes:
 - POST /incidents: Ingests an incident, triggers handle_incident(), saves the run, and returns
   the structured outcome.
 - GET /incidents/{incident_id}: Returns a previously saved incident record.
+- GET /incidents/{incident_id}/approvals: Lists an incident's approvals (optionally by status).
+- POST /incidents/{incident_id}/approvals/{approval_id}/approve and /reject: Record a human
+  decision. A decision never executes anything; resubmit the incident to act on it.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi import FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from agentic_ai.api.schemas import (
+    ApprovalDecisionRequest,
+    ApprovalListResponse,
+    ApprovalResponse,
     DiagnosticSummary,
     ErrorResponse,
     HealthResponse,
@@ -32,10 +38,23 @@ from agentic_ai.config import (
     Settings,
     get_settings,
 )
+from agentic_ai.domain.approvals import (
+    ApprovalDecisionError,
+    ApprovalRecord,
+    check_decidable,
+    plan_fingerprint,
+)
+from agentic_ai.domain.guardrails import ApprovalState
 from agentic_ai.domain.persistence import IncidentRecord
 from agentic_ai.llm.client import LLMConfigurationError, LLMRateLimitError
 from agentic_ai.persistence.factory import build_repository
-from agentic_ai.persistence.repository import IncidentConflictError, IncidentRepository
+from agentic_ai.persistence.repository import (
+    ApprovalConflictError,
+    ApprovalNotFoundError,
+    IncidentNotFoundError,
+    IncidentStore,
+)
+from agentic_ai.persistence.runs import RunPersistence, persist_workflow_run
 from agentic_ai.tools.mock_tools import DEFAULT_SCENARIO, Scenario
 from agentic_ai.workflows.incident import handle_incident
 
@@ -44,7 +63,7 @@ logger = logging.getLogger("agentic_ai.api")
 
 def create_app(
     settings: Settings | None = None,
-    repository: IncidentRepository | None = None,
+    repository: IncidentStore | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI service instance.
 
@@ -67,7 +86,7 @@ def create_app(
             return app.state.settings
         return get_settings()
 
-    def _repository() -> IncidentRepository:
+    def _repository() -> IncidentStore:
         if app.state.repository is None:
             app.state.repository = build_repository(_current_settings())
         return app.state.repository
@@ -211,6 +230,15 @@ def create_app(
         scenario = req.scenario or DEFAULT_SCENARIO
         post_scenario = req.post_remediation_scenario or Scenario.HEALTHY
 
+        # The workflow reads stored approvals at its execution boundary, so it needs the
+        # store. If the store cannot even be built, run without it: steps awaiting a
+        # human then simply stay unexecuted, and the response says nothing was persisted.
+        try:
+            store: IncidentStore | None = _repository()
+        except Exception as exc:
+            logger.error("Incident storage could not be initialised: %s", type(exc).__name__)
+            store = None
+
         try:
             state = handle_incident(
                 incident_description=req.incident_description,
@@ -218,6 +246,7 @@ def create_app(
                 post_remediation_scenario=post_scenario,
                 incident_id=req.incident_id,
                 correlation_id=req.correlation_id,
+                approval_repository=store,
             )
         except (LLMRateLimitError, LLMConfigurationError, ConfigurationError):
             raise
@@ -254,14 +283,11 @@ def create_app(
 
         # The run has already happened (and any simulated remediation with it), so a
         # failure to save must not hide the result. Report it instead.
-        persisted = False
-        try:
-            _repository().save_incident(IncidentRecord.from_workflow_state(state))
-            persisted = True
-        except IncidentConflictError as exc:
-            logger.error("Incident record conflicts with the stored one: %s", exc)
-        except Exception as exc:
-            logger.error("Failed saving incident record: %s", type(exc).__name__)
+        run = (
+            persist_workflow_run(store, state)
+            if store is not None
+            else RunPersistence(persisted=False, error="incident storage unavailable")
+        )
 
         return IncidentResponse(
             incident_id=state["incident_id"],
@@ -271,7 +297,8 @@ def create_app(
             diagnostic=diag_summary,
             verification=verif_summary,
             trace=state.get("trace"),
-            persisted=persisted,
+            persisted=run.persisted,
+            pending_approval_ids=run.pending_approval_ids,
         )
 
     @app.get(
@@ -297,6 +324,160 @@ def create_app(
                 detail=f"Incident '{incident_id}' not found.",
             )
         return record
+
+    # -- approvals ---------------------------------------------------------------
+
+    def _approval_view(approval: ApprovalRecord, record: IncidentRecord | None) -> ApprovalResponse:
+        stale: bool | None = None
+        decidable: bool | None = None
+        if record is not None:
+            ordered = sorted(record.remediations, key=lambda r: r.step_order)
+            current = plan_fingerprint((r.action_type, r.target_service) for r in ordered)
+            stale = current != approval.plan_fingerprint
+            try:
+                check_decidable(approval, record.status, record.remediations)
+                decidable = True
+            except ApprovalDecisionError:
+                decidable = False
+        return ApprovalResponse(
+            approval_id=approval.approval_id,
+            incident_id=approval.incident_id,
+            step_index=approval.step_index,
+            action_type=approval.action_type,
+            target_service=approval.target_service,
+            rationale=approval.rationale,
+            status=approval.status.value,
+            requested_at=approval.requested_at,
+            decided_at=approval.decided_at,
+            approver=approval.approver,
+            decision_reason=approval.decision_reason,
+            stale=stale,
+            decidable=decidable,
+        )
+
+    def _storage_unavailable(exc: Exception, action: str) -> HTTPException:
+        logger.error("Failed %s: %s", action, type(exc).__name__)
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Incident storage is unavailable.",
+        )
+
+    @app.get(
+        "/incidents/{incident_id}/approvals",
+        response_model=ApprovalListResponse,
+        responses={404: {"model": ErrorResponse, "description": "Incident not found"}},
+        summary="List an Incident's Approvals",
+        tags=["Approvals"],
+    )
+    def list_approvals(
+        incident_id: str,
+        status_filter: Literal["pending", "approved", "rejected"] | None = Query(
+            default=None,
+            alias="status",
+            description="Only approvals in this status.",
+        ),
+    ) -> ApprovalListResponse:
+        """Approvals for one incident, oldest request first.
+
+        ``stale`` marks an approval whose plan was replaced; ``decidable`` says whether
+        a decision would be accepted right now.
+        """
+        try:
+            store = _repository()
+            record = store.get_incident(incident_id)
+            if record is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Incident '{incident_id}' not found.",
+                )
+            approvals = store.list_approvals(
+                incident_id, ApprovalState(status_filter) if status_filter else None
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise _storage_unavailable(exc, "listing approvals") from exc
+        return ApprovalListResponse(
+            incident_id=incident_id,
+            approvals=[_approval_view(a, record) for a in approvals],
+        )
+
+    def _decide(
+        incident_id: str,
+        approval_id: str,
+        req: ApprovalDecisionRequest,
+        outcome: ApprovalState,
+    ) -> ApprovalResponse:
+        try:
+            store = _repository()
+            decided = store.decide_approval(
+                incident_id, approval_id, outcome, req.approver, req.reason
+            )
+        except IncidentNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ApprovalNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ApprovalConflictError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        except Exception as exc:
+            raise _storage_unavailable(exc, "recording an approval decision") from exc
+
+        # The decision is committed. A failure to re-read the incident only costs the
+        # stale/decidable hints; it must not turn a successful decision into an error.
+        record: IncidentRecord | None = None
+        try:
+            record = store.get_incident(incident_id)
+        except Exception as exc:
+            logger.error("Failed re-reading incident after a decision: %s", type(exc).__name__)
+        return _approval_view(decided, record)
+
+    _DECISION_NOTE = (
+        " Recording a decision does not execute anything and does not resolve the incident: "
+        "resubmit the same incident_id and the workflow will act on it, subject to every "
+        "guardrail. The approver name is caller-supplied and NOT authenticated."
+    )
+
+    @app.post(
+        "/incidents/{incident_id}/approvals/{approval_id}/approve",
+        response_model=ApprovalResponse,
+        responses={
+            404: {"model": ErrorResponse, "description": "Incident or approval not found"},
+            409: {
+                "model": ErrorResponse,
+                "description": "Already decided, incident closed, or plan superseded",
+            },
+        },
+        summary="Approve a Remediation Step",
+        description="Approve exactly one pending remediation step." + _DECISION_NOTE,
+        tags=["Approvals"],
+    )
+    def approve_step(
+        incident_id: str, approval_id: str, req: ApprovalDecisionRequest
+    ) -> ApprovalResponse:
+        """Approve exactly one pending remediation step."""
+        return _decide(incident_id, approval_id, req, ApprovalState.APPROVED)
+
+    @app.post(
+        "/incidents/{incident_id}/approvals/{approval_id}/reject",
+        response_model=ApprovalResponse,
+        responses={
+            404: {"model": ErrorResponse, "description": "Incident or approval not found"},
+            409: {
+                "model": ErrorResponse,
+                "description": "Already decided, incident closed, or plan superseded",
+            },
+        },
+        summary="Reject a Remediation Step",
+        description=(
+            "Reject exactly one pending remediation step; it will never execute." + _DECISION_NOTE
+        ),
+        tags=["Approvals"],
+    )
+    def reject_step(
+        incident_id: str, approval_id: str, req: ApprovalDecisionRequest
+    ) -> ApprovalResponse:
+        """Reject exactly one pending remediation step; it will never execute."""
+        return _decide(incident_id, approval_id, req, ApprovalState.REJECTED)
 
     return app
 
