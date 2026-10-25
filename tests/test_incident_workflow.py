@@ -498,3 +498,389 @@ def test_guardrails_do_not_run_without_a_plan(stub_dependencies) -> None:
     )
 
     assert handle_incident("Payment service is down")["guarded_plan"] is None
+
+
+# --- remediation execution integration ----------------------------------
+
+
+def test_allowed_step_executes_in_workflow(stub_dependencies) -> None:
+    from agentic_ai.domain.remediation import ExecutionStatus
+    from agentic_ai.tools.incident_memory import load_memory
+
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[_finding()]))
+
+    state = handle_incident("Payment service is down")
+
+    assert state["remediation_execution"] is not None
+    (result,) = state["remediation_execution"].step_results
+    assert result.status == ExecutionStatus.EXECUTED
+    assert "[SIMULATED]" in result.output
+    assert state["next_step"] == "escalate"
+
+    (entry,) = load_memory()
+    assert "Executed: increase_connection_pool on payment" in entry.resolution
+    assert "Recovery: unresolved" in entry.resolution
+
+
+def test_approval_pending_step_is_not_executed_in_workflow(
+    stub_dependencies, monkeypatch
+) -> None:
+    from agentic_ai.domain.remediation import ExecutionStatus
+    from agentic_ai.tools.incident_memory import load_memory
+
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[_finding()]))
+    monkeypatch.setattr(
+        workflow_module,
+        "plan_remediation",
+        lambda desc, analysis: RemediationPlan(
+            steps=[
+                RemediationStep(
+                    action_type=RemediationActionType.ROLLBACK_DEPLOYMENT,
+                    target_service="payment",
+                    rationale="Roll back faulty deploy.",
+                )
+            ]
+        ),
+    )
+
+    state = handle_incident("Payment service is down")
+
+    assert state["remediation_execution"] is not None
+    (result,) = state["remediation_execution"].step_results
+    assert result.status == ExecutionStatus.SKIPPED
+    assert "awaiting human approval" in result.output
+    assert state["next_step"] == "escalate"
+
+    (entry,) = load_memory()
+    assert "Skipped: rollback_deployment on payment" in entry.resolution
+    assert "Recovery: skipped" in entry.resolution
+
+
+def test_approval_rejected_step_is_not_executed_in_workflow(
+    stub_dependencies, monkeypatch
+) -> None:
+    from agentic_ai.domain.guardrails import guard_plan
+    from agentic_ai.domain.remediation import ExecutionStatus
+    from agentic_ai.tools.incident_memory import load_memory
+
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[_finding()]))
+    monkeypatch.setattr(
+        workflow_module,
+        "plan_remediation",
+        lambda desc, analysis: RemediationPlan(
+            steps=[
+                RemediationStep(
+                    action_type=RemediationActionType.ROLLBACK_DEPLOYMENT,
+                    target_service="payment",
+                    rationale="Roll back deploy.",
+                )
+            ]
+        ),
+    )
+
+    orig_guard_plan = guard_plan
+
+    def reject_plan(plan, analysis, investigated):
+        guarded = orig_guard_plan(plan, analysis, investigated)
+        return guarded.reject(0, "lead_sre")
+
+    monkeypatch.setattr(workflow_module, "guard_plan", reject_plan)
+
+    state = handle_incident("Payment service is down")
+
+    assert state["remediation_execution"] is not None
+    (result,) = state["remediation_execution"].step_results
+    assert result.status == ExecutionStatus.SKIPPED
+    assert "rejected by lead_sre" in result.output
+    assert state["next_step"] == "escalate"
+
+    (entry,) = load_memory()
+    assert "Skipped: rollback_deployment on payment" in entry.resolution
+    assert "Recovery: skipped" in entry.resolution
+
+
+def test_blocked_step_never_reaches_mock_handler_in_workflow(
+    stub_dependencies, monkeypatch
+) -> None:
+    from unittest.mock import Mock
+
+    from agentic_ai.domain.remediation import ExecutionStatus
+    from agentic_ai.tools import mock_remediation
+    from agentic_ai.tools.incident_memory import load_memory
+
+    low_confidence_analysis = RootCauseAnalysis(
+        root_cause="Uncertain root cause.",
+        root_cause_confidence=0.2,
+        knowledge_base_consistency=KnowledgeBaseConsistency.NO_RELEVANT_PRECEDENT,
+    )
+    stub_dependencies(
+        Severity.CRITICAL,
+        investigation=_result(findings=[_finding()]),
+        rca_result=low_confidence_analysis,
+    )
+    monkeypatch.setattr(
+        workflow_module,
+        "plan_remediation",
+        lambda desc, analysis: RemediationPlan(
+            steps=[
+                RemediationStep(
+                    action_type=RemediationActionType.FAILOVER,
+                    target_service="payment",
+                    rationale="Attempt failover.",
+                )
+            ]
+        ),
+    )
+
+    spy_handler = Mock(wraps=mock_remediation.execute_mock_remediation_step)
+    monkeypatch.setattr(mock_remediation, "execute_mock_remediation_step", spy_handler)
+
+    state = handle_incident("Payment service is down")
+
+    assert state["remediation_execution"] is not None
+    (result,) = state["remediation_execution"].step_results
+    assert result.status == ExecutionStatus.BLOCKED
+    assert "blocked" in result.output.lower()
+    spy_handler.assert_not_called()
+    assert state["next_step"] == "escalate"
+
+    (entry,) = load_memory()
+    assert "Blocked: failover on payment" in entry.resolution
+    assert "Recovery: skipped" in entry.resolution
+
+
+def test_execution_results_propagate_through_workflow_state(stub_dependencies) -> None:
+    from agentic_ai.domain.remediation import RemediationExecution
+
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[_finding()]))
+
+    state = handle_incident("Payment service is down")
+
+    assert "remediation_execution" in state
+    assert isinstance(state["remediation_execution"], RemediationExecution)
+    assert len(state["remediation_execution"].step_results) == 1
+    assert state["remediation_execution"].completed_at.tzinfo is not None
+
+
+def test_remediation_execution_does_not_run_on_monitor_path(stub_dependencies) -> None:
+    stub_dependencies(
+        Severity.LOW,
+        investigation=_result(findings=[_finding()]),
+    )
+
+    state = handle_incident("Minor logging delay")
+
+    assert state["next_step"] == "monitor"
+    assert state["remediation_execution"] is None
+
+
+def test_accurate_incident_memory_summaries_with_multiple_steps(
+    stub_dependencies, monkeypatch
+) -> None:
+    from agentic_ai.domain.remediation import ExecutionStatus
+    from agentic_ai.tools.incident_memory import load_memory
+
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[_finding()]))
+    monkeypatch.setattr(
+        workflow_module,
+        "plan_remediation",
+        lambda desc, analysis: RemediationPlan(
+            steps=[
+                RemediationStep(
+                    action_type=RemediationActionType.SCALE_UP,
+                    target_service="payment",
+                    rationale="Scale up.",
+                ),
+                RemediationStep(
+                    action_type=RemediationActionType.ROLLBACK_DEPLOYMENT,
+                    target_service="payment",
+                    rationale="Roll back.",
+                ),
+            ]
+        ),
+    )
+
+    state = handle_incident("Payment service is down")
+
+    assert state["remediation_execution"] is not None
+    results = state["remediation_execution"].step_results
+    assert len(results) == 2
+    assert results[0].status == ExecutionStatus.EXECUTED
+    assert results[1].status == ExecutionStatus.SKIPPED
+
+    (entry,) = load_memory()
+    assert (
+        "Executed: scale_up on payment; Skipped: rollback_deployment on payment"
+        in entry.resolution
+    )
+    assert "Recovery: unresolved" in entry.resolution
+
+
+def test_escalation_behavior_remains_unchanged(stub_dependencies) -> None:
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[_finding()]))
+
+    state = handle_incident("Payment service is down")
+
+    assert state["next_step"] == "escalate"
+
+
+# --- verification integration (Phase 12) ---------------------------------
+
+
+def test_successful_recovery_routes_to_resolve_node(stub_dependencies) -> None:
+    from agentic_ai.domain.verification import VerificationStatus
+    from agentic_ai.tools.incident_memory import load_memory
+
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[_finding()]))
+
+    state = handle_incident(
+        "Payment service is down",
+        post_remediation_scenario=Scenario.HEALTHY,
+    )
+
+    assert state["verification"] is not None
+    assert state["verification"].status == VerificationStatus.RECOVERED
+    assert state["verification"].is_recovered is True
+    assert state["next_step"] == "resolve"
+
+    (entry,) = load_memory()
+    assert "Recovery: verified recovered" in entry.resolution
+
+
+def test_failed_recovery_routes_to_escalate(stub_dependencies) -> None:
+    from agentic_ai.domain.verification import VerificationStatus
+    from agentic_ai.tools.incident_memory import load_memory
+
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[_finding()]))
+
+    state = handle_incident(
+        "Payment service is down",
+        post_remediation_scenario=Scenario.CONNECTION_POOL_EXHAUSTION,
+    )
+
+    assert state["verification"] is not None
+    assert state["verification"].status == VerificationStatus.UNRESOLVED
+    assert state["verification"].is_recovered is False
+    assert state["next_step"] == "escalate"
+
+    (entry,) = load_memory()
+    assert "Recovery: unresolved" in entry.resolution
+
+
+def test_inconclusive_verification_routes_to_escalate(
+    stub_dependencies, monkeypatch
+) -> None:
+    from agentic_ai.domain.verification import (
+        VerificationResult,
+        VerificationStatus,
+    )
+    from agentic_ai.tools.incident_memory import load_memory
+
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[_finding()]))
+    monkeypatch.setattr(
+        workflow_module,
+        "verify_service_health",
+        lambda service, scenario, attempts: VerificationResult(
+            status=VerificationStatus.INCONCLUSIVE,
+            attempts=1,
+            reasons=["could not read output from: get_mock_metrics"],
+        ),
+    )
+
+    state = handle_incident("Payment service is down")
+
+    assert state["verification"] is not None
+    assert state["verification"].status == VerificationStatus.INCONCLUSIVE
+    assert state["next_step"] == "escalate"
+
+    (entry,) = load_memory()
+    assert "Recovery: inconclusive" in entry.resolution
+
+
+def test_skipped_verification_when_remediation_blocked_routes_to_escalate(
+    stub_dependencies, monkeypatch
+) -> None:
+    from agentic_ai.domain.verification import VerificationStatus
+    from agentic_ai.tools.incident_memory import load_memory
+
+    low_confidence_analysis = RootCauseAnalysis(
+        root_cause="Uncertain.",
+        root_cause_confidence=0.2,
+        knowledge_base_consistency=KnowledgeBaseConsistency.NO_RELEVANT_PRECEDENT,
+    )
+    stub_dependencies(
+        Severity.CRITICAL,
+        investigation=_result(findings=[_finding()]),
+        rca_result=low_confidence_analysis,
+    )
+    monkeypatch.setattr(
+        workflow_module,
+        "plan_remediation",
+        lambda desc, analysis: RemediationPlan(
+            steps=[
+                RemediationStep(
+                    action_type=RemediationActionType.FAILOVER,
+                    target_service="payment",
+                    rationale="Failover.",
+                )
+            ]
+        ),
+    )
+
+    state = handle_incident("Payment service is down")
+
+    assert state["verification"] is not None
+    assert state["verification"].status == VerificationStatus.SKIPPED
+    assert state["next_step"] == "escalate"
+
+    (entry,) = load_memory()
+    assert "Recovery: skipped" in entry.resolution
+
+
+def test_never_automatically_reruns_remediation(stub_dependencies, monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[_finding()]))
+
+    spy_executor = Mock(wraps=workflow_module.execute_guarded_plan)
+    monkeypatch.setattr(workflow_module, "execute_guarded_plan", spy_executor)
+
+    # Verification fails (unresolved)
+    state = handle_incident(
+        "Payment service is down",
+        post_remediation_scenario=Scenario.CONNECTION_POOL_EXHAUSTION,
+    )
+
+    assert state["next_step"] == "escalate"
+    # Executor must have been called exactly once: no repeat loop!
+    assert spy_executor.call_count == 1
+
+
+def test_verification_results_propagate_in_workflow_state(
+    stub_dependencies,
+) -> None:
+    from agentic_ai.domain.verification import VerificationResult
+
+    stub_dependencies(Severity.CRITICAL, investigation=_result(findings=[_finding()]))
+
+    state = handle_incident(
+        "Payment service is down",
+        post_remediation_scenario=Scenario.HEALTHY,
+    )
+
+    assert "verification" in state
+    assert isinstance(state["verification"], VerificationResult)
+    assert state["verification"].attempts == 1
+    assert state["verification"].verified_at.tzinfo is not None
+
+
+def test_monitor_path_bypasses_verification(stub_dependencies) -> None:
+    stub_dependencies(
+        Severity.LOW,
+        investigation=_result(findings=[_finding()]),
+    )
+
+    state = handle_incident("Minor logging delay")
+
+    assert state["next_step"] == "monitor"
+    assert state["verification"] is None
