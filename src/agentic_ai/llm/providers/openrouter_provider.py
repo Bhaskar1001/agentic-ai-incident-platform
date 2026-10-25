@@ -30,7 +30,10 @@ from agentic_ai.llm.client import (
 
 load_dotenv()
 
-DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+# Free models come and go: the previous default, nvidia/nemotron-3-super-120b-a12b:free, stayed
+# listed but started answering 404 upstream. This one was checked end to end (structured output,
+# tool calling and two full incident scenarios) rather than just from its published parameters.
+DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3.5-super-vl:free"
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 REQUEST_TIMEOUT_SECONDS = 60.0
 

@@ -14,7 +14,8 @@
 > Execution and verification act on mocks; approvals can now be granted over HTTP but the approver is
 > an unauthenticated label; and the Docker image has never been built. Persistence is now real: the API saves each run to PostgreSQL when
 > `DATABASE_URL` is set, verified against an embedded PostgreSQL 16.2 and, in CI, against the official
-> `postgres:16` image (GitHub Actions is green). The default LLM model is currently dead upstream. See sections 5 and 6.
+> `postgres:16` image (GitHub Actions is green). The live LLM path was re-verified with a replacement model (see the model entry); the
+> developer's `.env` still pins the old, dead one. See sections 5 and 6.
 >
 > The log was stale from 2026-10-16 (Phase 10) to 2026-10-25: Phases 11-16 were written outside the
 > sessions that produced the earlier entries, then reviewed and committed together. Their entries
@@ -1524,7 +1525,7 @@ loads the same way the provider does). The guard has two deterministic tests. `r
 now covers the whole tree: that needed one mechanical commit (`d39079a`, 46 files reformatted, no
 behaviour change) so the check could pass. 
 
-**Side finding, not fixed:** with a real key present, the live test fails with a 404. OpenRouter
+**Side finding (fixed later: see the model entry):** with a real key present, the live test fails with a 404. OpenRouter
 still lists `nvidia/nemotron-3-super-120b-a12b:free`, but the upstream provider answers
 `Function '...': Not found for account`, so the project's default model is currently unusable. The
 fix is choosing another free model, a decision that also spends the 50-requests/day quota; it is
@@ -1901,6 +1902,44 @@ warns that `actions/checkout@v4` and `astral-sh/setup-uv@v5` target Node 20, whi
 
 ---
 
+### Default LLM model replaced, and the live path verified for the first time since Phase 7 ✅
+
+The earlier default, `nvidia/nemotron-3-super-120b-a12b:free`, stayed listed on OpenRouter but answered
+404 from its upstream provider (see the CI fix entry), so no live run worked. It is replaced by
+**`nvidia/nemotron-3.5-super-vl:free`**.
+
+**How it was chosen, and what that does and does not show.** Of 17 free models, four advertise every
+parameter this project sends (tool calls and a JSON-schema response format). Probing used the
+project's own client, two requests per model, sparingly because the free tier is 50 requests a day:
+
+| Model | Structured output | Tool calling | Verdict |
+|---|---|---|---|
+| `nvidia/nemotron-3.5-super-vl:free` | worked (`critical` for a total outage, 4.3 s) | worked on retry (the first try was a transient `502`) | chosen |
+| `google/gemma-4-26b-a4b-it:free` | not tested | not tested | upstream provider rate-limited it ("Provider returned error"); says nothing about the model |
+| `xingchen-agi/xing4.0-29b-a4b:free`, `dots-studio/dots-3-note-preview:free` | not probed | not probed | left alone to preserve quota |
+
+Two probes are not proof, so the chosen model was then run through the real workflow with the demo
+command, with only an environment-variable override and no code change:
+- `connection_pool_exhaustion`: severity `critical`, **resolved**, verification `recovered`, 9 stages and
+  5 tool invocations in about 117 s.
+- `healthy`: severity `low`, routed to **monitor**, 3 tool invocations, no invented fault (the failure the
+  project hit in Phase 5.5).
+- The previously failing live test (`test_assess_severity_live`) passes against it in about 5 s.
+
+This is the first live-LLM verification since Phase 7, and so covers RCA, the remediation planner and the
+Phase 8 to 18 changes end to end for the pool-exhaustion path.
+
+**Limits of that evidence.** One model, one run per scenario, and not the `upstream_dependency_failure`
+scenario. The project's own history shows model behaviour varies run to run, so this is two good runs,
+not a measured rate. Free models also vanish or break without notice, as the last default did.
+
+**Action needed on the developer machine.** The local, git-ignored `.env` pins
+`OPENROUTER_MODEL=nvidia/nemotron-3-super-120b-a12b:free`, which overrides the new default. Until that line
+is changed (or deleted) local live runs and the live test still 404. `.env` holds the API key, so it was
+deliberately left untouched.
+
+---
+
 ### Hardening — understanding and surfacing the OpenRouter rate limit properly ✅
 
 **Goal:** the free-tier 429 had been hit twice (Phase 5.6, Phase 7) and left as an open known issue
@@ -2033,7 +2072,7 @@ src/agentic_ai/
 *dev:* `pytest`, `ruff`.
 
 **LLM provider:** OpenRouter by default (`LLM_PROVIDER=openrouter`), model
-`nvidia/nemotron-3-super-120b-a12b:free`, subject to the 50 requests/day account quota. Ollama via
+`nvidia/nemotron-3.5-super-vl:free`, subject to the 50 requests/day account quota. Ollama via
 `LLM_PROVIDER=ollama`.
 
 **What is real versus simulated:**
@@ -2080,7 +2119,8 @@ and fixes `0b3d2fe`, `b97b531`, `5765715`. All of these are pushed to `origin/ma
 | Verification is injected, not causal | Open | RECOVERED depends on the `post_remediation_scenario` argument (API default `HEALTHY`); the mock executor changes nothing. No retry or re-investigation loop although `MAX_VERIFICATION_ATTEMPTS = 2` exists |
 | CI fails on the live-LLM test | Resolved | The test skips without a key and has a `live` marker (`12e67b8`) |
 | `ruff format --check` covers a hand-picked file list | Resolved | Now `ruff format --check .` after a mechanical reformat (`d39079a`) |
-| Default OpenRouter model returns 404 | **Open, blocks live use** | `nvidia/nemotron-3-super-120b-a12b:free` is still listed but the upstream provider answers `Function '...': Not found for account`. Live runs and the app's default model fail until another free model is chosen, which also spends the 50 requests/day quota |
+| Default OpenRouter model returned 404 | Resolved in code; **local `.env` still pins the dead model** | The default is now `nvidia/nemotron-3.5-super-vl:free`, verified end to end (see the model entry). A developer's `.env` with `OPENROUTER_MODEL=nvidia/nemotron-3-super-120b-a12b:free` overrides it, so live runs there still 404 until that line is changed |
+| Free-model fragility and thin live evidence | Open | Free models can vanish or break without notice. The live evidence is one model, one run per scenario for two scenarios, with the upstream-failure scenario untried; behaviour varies run to run, so this is not a measured success rate |
 | CI's PostgreSQL service | Resolved | Run `40187027504` on `5765715` passed with the PostgreSQL tests running against the official `postgres:16` image with password authentication |
 | GitHub Actions uses Node 20 actions | Open | `actions/checkout@v4` and `astral-sh/setup-uv@v5` target Node 20, which GitHub is deprecating (it currently forces Node 24; they still work). Bump the versions |
 | Local PostgreSQL is more permissive than CI's | Open, mitigated | The embedded server trusts every connection and hid a password bug that only CI exposed. Re-check anything touching connections against a password-authenticated server (a scratch harness did this for the fix) |
@@ -2264,3 +2304,7 @@ Extracted from decisions actually made in this project, not aspirational:
 40. **Make failures readable where they happen.** Two CI runs were spent unable to see why a test
     failed, because the job log needed admin rights. Printing failures as annotations turned a blind
     guess into a one-line diagnosis. Do not keep changing things while you cannot see the error.
+41. **A model being listed, with the right advertised parameters, does not mean it works.** The old
+    default was still listed and still claimed tool and schema support while its upstream returned 404.
+    Choosing the replacement meant calling it through the project's own client and then running the
+    real workflow, including the healthy case, not reading its metadata.
