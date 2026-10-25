@@ -1,7 +1,7 @@
-"""Domain model for remediation planning.
+"""Domain model for remediation planning and execution results.
 
-A remediation plan is a *proposal*: nothing in this phase executes anything.
-Two decisions are made structurally rather than left to the model:
+A remediation plan is a *proposal*: nothing in the planning phase executes
+anything. Two decisions are made structurally rather than left to the model:
 
 - The model chooses from a closed menu of action types. An action outside the
   menu is invalid structured output, not a creative suggestion.
@@ -10,9 +10,15 @@ Two decisions are made structurally rather than left to the model:
   escalation decision: a safety-relevant label should not be something a
   confident-sounding narrative can talk its way into.
 
+Phase 11 adds execution-result models: ``ExecutionStatus``,
+``StepExecutionResult``, and ``RemediationExecution``. These record what
+happened when each guarded step was acted on (or deliberately not acted on).
+They do not implement the executor itself.
+
 Free of LLM and framework imports.
 """
 
+from datetime import datetime, timezone
 from enum import Enum
 
 from pydantic import BaseModel, Field, computed_field
@@ -84,10 +90,55 @@ class RemediationPlan(BaseModel):
         )
 
 
+class ExecutionStatus(str, Enum):
+    """What happened when a guarded step was acted on."""
+
+    EXECUTED = "executed"
+    """The mock executor ran the action successfully."""
+
+    SKIPPED = "skipped"
+    """The step was not attempted (e.g. not approved, or not required)."""
+
+    BLOCKED = "blocked"
+    """The guardrail policy forbade execution outright."""
+
+    FAILED = "failed"
+    """The executor attempted the action and it did not succeed."""
+
+
+class StepExecutionResult(BaseModel, frozen=True):
+    """The outcome of acting (or declining to act) on one guarded step.
+
+    Frozen for the same reason ``GuardedStep`` is: once the system has
+    recorded what it did, rewriting that record is a bug, not a feature.
+    """
+
+    step: RemediationStep
+    status: ExecutionStatus
+    output: str
+    """Deterministic description of what the executor did or why it did not."""
+    error: str | None = None
+    executed_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+
+class RemediationExecution(BaseModel, frozen=True):
+    """The complete record of executing (or declining) a guarded plan."""
+
+    step_results: list[StepExecutionResult] = Field(default_factory=list)
+    completed_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+
 __all__ = [
+    "ExecutionStatus",
     "RISK_BY_ACTION",
     "RemediationActionType",
+    "RemediationExecution",
     "RemediationPlan",
     "RemediationStep",
     "RiskTier",
+    "StepExecutionResult",
 ]
