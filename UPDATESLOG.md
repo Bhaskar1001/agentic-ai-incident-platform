@@ -3,16 +3,17 @@
 > Single source of truth for this project: what it is, why it exists, what has been built in each
 > phase, and the reasoning behind every significant decision.
 >
-> **Last updated:** 2026-10-25 · **Current phase:** Phases 1-16 have code and tests (461 passing,
-> 1 skipped). The pipeline now runs end to end: assess, investigate, route on evidence, root cause
+> **Last updated:** 2026-10-25 · **Current phase:** Phases 1-16 have code and tests (493 passing
+> and 3 skipped without a database; 496 passing with one). The pipeline now runs end to end: assess, investigate, route on evidence, root cause
 > analysis, remediation plan, guardrails, **simulated** execution, deterministic verification, memory,
 > then resolve or escalate. It is wrapped in a FastAPI service, a demo CLI, structured tracing, a
 > golden-case evaluation harness, a Dockerfile and CI.
 >
 > **Read this before trusting the roadmap:** most of what is "done" is simulated or unconnected.
-> Execution and verification act on mocks; persistence is a contract with no database behind it; no
-> API route can grant a human approval; the Docker image and the Postgres migrations have never been
-> run; and CI will fail on the live-LLM test. See sections 5 and 6 for the full list.
+> Execution and verification act on mocks; no API route can grant a human approval; and the Docker
+> image has never been built. Persistence is now real: the API saves each run to PostgreSQL when
+> `DATABASE_URL` is set, verified against an embedded PostgreSQL 16.2 (not yet in CI, and no other
+> server). The default LLM model is currently dead upstream. See sections 5 and 6.
 >
 > The log was stale from 2026-10-16 (Phase 10) to 2026-10-25: Phases 11-16 were written outside the
 > sessions that produced the earlier entries, then reviewed and committed together. Their entries
@@ -1514,6 +1515,80 @@ retrieval material.
 
 ---
 
+### CI fix · `d39079a`, `12e67b8`
+
+`test_assess_severity_live` now carries a registered `live` marker and skips when the configured
+provider is OpenRouter and no key is set (the key may sit in a gitignored `.env`, which the guard
+loads the same way the provider does). The guard has two deterministic tests. `ruff format --check`
+now covers the whole tree: that needed one mechanical commit (`d39079a`, 46 files reformatted, no
+behaviour change) so the check could pass. 
+
+**Side finding, not fixed:** with a real key present, the live test fails with a 404. OpenRouter
+still lists `nvidia/nemotron-3-super-120b-a12b:free`, but the upstream provider answers
+`Function '...': Not found for account`, so the project's default model is currently unusable. The
+fix is choosing another free model, a decision that also spends the 50-requests/day quota; it is
+recorded under Known Issues rather than changed silently.
+
+---
+
+### Phase 16b — PostgreSQL persistence, wired in ✅ · `eaad8fd`, `9bbb696`, `56813a4`, `7d3dcb3`
+
+**A bug first, because it changes how to read the earlier Phase 16 entry.**
+`IncidentRecord.from_workflow_state` read `step_order` and `parameters` off `RemediationStep`, which
+has neither, so *any real run with a remediation plan raised `AttributeError`*. The existing tests
+passed because they never gave the mapper a real guarded plan. Had persistence been wired in as it
+stood, the API would have either crashed or (through its catch-all) quietly stored nothing. Steps
+are now ordered by plan position, which is exactly how `execute_guarded_plan` emits results, and a
+regression test builds the state from real planner, guardrail and executor objects.
+
+**Built:**
+- `persistence/postgres.py`: `PostgresIncidentRepository`. Takes a `connect` callable, runs each
+  operation in one transaction (commit, or roll back on any failure), takes a row lock
+  (`FOR UPDATE`) before the terminal-conflict check, replaces child rows wholesale, and loads stages
+  and remediations in two queries however many incidents a list returns. Driver errors are wrapped
+  in `IncidentPersistenceError`; conflicts and bad arguments pass through unchanged.
+- `persistence/factory.py`: PostgreSQL when `DATABASE_URL` is set, otherwise in-memory.
+- `python -m agentic_ai.persistence migrate`: applies migrations, idempotent, reports the failure
+  class only (driver messages can echo the connection string).
+- `POST /incidents` saves each run; new `GET /incidents/{incident_id}`. A failed save is logged and
+  returned as `persisted: false` instead of an error, because the run (and any simulated
+  remediation) already happened and hiding the result would not undo it.
+- `DiagnosticSummary` and `VerificationSummary` moved to `domain/summaries.py` (re-exported from
+  `api.schemas` under the same names), which removes the domain-imports-API inversion.
+- CI gets a `postgres:16` service and `DATABASE_URL`.
+
+**What was verified, and against what:**
+- Against a **real PostgreSQL 16.2** (an embedded server from the `pgserver` package, run from a
+  throwaway environment; it is not a project dependency): the migration applies and creates all four
+  tables with a checksum recorded; one contract scenario passes for PostgreSQL and for the in-memory
+  repository (round trip with children and JSON columns, newest-first ordering, status filter,
+  terminal-record immutability with the failed saves changing nothing, children replaced not
+  accumulated); `POST /incidents` to the database and back through `GET` works; the migrate command
+  run twice reports `Applied: 001` then `Database is up to date.`
+- The whole suite also passes with `DATABASE_URL` set, which is what CI will do.
+- **Not verified:** the CI workflow itself (GitHub Actions was not run), and any PostgreSQL other
+  than that embedded 16.2 build (no Docker daemon was available; no managed or containerised server).
+
+**Tests:** 493 passed, 3 skipped without a database; 496 passed with one. The three skips are the
+live-database tests. 24 new in `test_postgres_repository.py` (fake-connection unit tests, the
+contract test, the migrate command), 5 new API tests, 1 regression test. The fake-connection tests
+prove the Python logic only; a fake accepts any SQL string, so the live runs above are the real
+evidence for the SQL.
+
+**Known limits:**
+- **No connection pooling**: one connection per operation. Add a pool when connection setup is a
+  measured cost.
+- **Like the in-memory repository, a re-save overwrites `created_at`** with the incoming record's
+  value. Parity was chosen over fixing it in one implementation; callers re-saving should pass the
+  original. `POST /incidents` creates the record fresh each time, so resubmitting an `incident_id`
+  rewrites its `created_at`.
+- A resubmitted terminal incident with a different outcome is a conflict: the response is still
+  returned, with `persisted: false` and the conflict logged.
+- The default `app` falls back to in-memory storage without `DATABASE_URL`: not an audit trail.
+- Nothing yet reads these records except `GET /incidents/{id}`; there is no list endpoint.
+
+---
+
 ### Hardening — understanding and surfacing the OpenRouter rate limit properly ✅
 
 **Goal:** the free-tier 429 had been hit twice (Phase 5.6, Phase 7) and left as an open known issue
@@ -1589,9 +1664,10 @@ hours.
 
 ## 5. Current State
 
-**Test suite: 461 passed, 1 skipped** (plus `test_assess_severity_live`, which needs a live LLM and
-OpenRouter quota, and is deselected in the runs reported here). The skip is the live PostgreSQL
-migration test. Everything else is deterministic: the knowledge tests load a real local embedding
+**Test suite: 493 passed, 3 skipped without a database; 496 passed with `DATABASE_URL` set.** The
+three skips are the live-PostgreSQL tests. `test_assess_severity_live` is deselected in these runs:
+it now skips without an OpenRouter key, and with one it currently fails (see Known Issues).
+Everything else is deterministic: the knowledge tests load a real local embedding
 model but no LLM, the OpenRouter provider tests mock HTTP, and the evaluation harness stubs the LLM
 steps. Full run takes about 3 minutes, mostly the embedding model. `ruff check` passes.
 
@@ -1606,7 +1682,8 @@ src/agentic_ai/
 │   ├── remediation.py       Action types, risk tiers, plan, execution results
 │   ├── guardrails.py        Tier policy, GuardedPlan, approve()/reject()
 │   ├── verification.py      VerificationStatus, evaluate_verification()
-│   └── persistence.py       Incident run records (imports api.schemas: see Known Issues)
+│   ├── summaries.py         DiagnosticSummary, VerificationSummary
+│   └── persistence.py       Incident run records and their mapping from workflow state
 ├── llm/                     client + providers (OpenRouter default, Ollama), severity, rca,
 │                            remediation: all one-shot structured-output calls
 ├── tools/
@@ -1621,17 +1698,18 @@ src/agentic_ai/
 ├── mcp_server/server.py     Read-only MCP server over the investigation tools
 ├── evaluation/              9 golden cases, runner, metrics, invariants
 ├── observability/           Tracer, trace models, redaction
-├── persistence/             Repository protocol, in-memory repo, migrator, SQL migration
-├── api/                     FastAPI: /health, /ready, POST /incidents
+├── persistence/             Repository protocol, in-memory and PostgreSQL repos, factory,
+│                            migrator, `migrate` command, SQL migration
+├── api/                     FastAPI: /health, /ready, POST /incidents, GET /incidents/{id}
 ├── config.py                Validated settings
 └── cli.py                   agentic-ai-demo
 ```
 
-**Entry points:** `agentic-ai-demo` (CLI), `agentic-ai-mcp` (MCP server), and
-`uvicorn agentic_ai.api.app:app` (API).
+**Entry points:** `agentic-ai-demo` (CLI), `agentic-ai-mcp` (MCP server),
+`uvicorn agentic_ai.api.app:app` (API), and `python -m agentic_ai.persistence migrate`.
 
 **Dependencies:** `langgraph` · `httpx` · `python-dotenv` · `sentence-transformers` · `numpy` ·
-`pydantic` · `ollama` (kept, not default) · `mcp` · `fastapi` · `psycopg[binary]` (declared, unused) ·
+`pydantic` · `ollama` (kept, not default) · `mcp` · `fastapi` · `psycopg[binary]` ·
 *dev:* `pytest`, `ruff`.
 
 **LLM provider:** OpenRouter by default (`LLM_PROVIDER=openrouter`), model
@@ -1645,12 +1723,13 @@ src/agentic_ai/
 | LLM calls for severity, investigation, RCA, planning | Observability tools (fixed fixtures) |
 | Deterministic escalation, guardrails, verification logic | Remediation execution (returns text only) |
 | Local embedding retrieval, JSONL memory | Post-remediation health (an injected scenario) |
-| MCP server, FastAPI service | Persistence (in-memory only; no database used) |
+| MCP server, FastAPI service | Persistence is real but only verified on one embedded PostgreSQL build |
+| Incident persistence to PostgreSQL | Falls back to in-memory (not durable) without `DATABASE_URL` |
 
 **Commit index:** Phases 1-7 and the rate-limit hardening, up to `dc31bc1` (pushed) · Phase 7b and 8 `c59edc6` · Phase 9 `3f1807c` ·
-Phase 10 `b3b2b75` · Phase 11 `0397465` · Phase 12 `b5fd76d` · Phase 14 `73f5e20` · workflow
+Phase 10 `b3b2b75` · CI fix `d39079a`, `12e67b8` · Phase 16b `eaad8fd`, `9bbb696`, `56813a4`, `7d3dcb3` · Phase 11 `0397465` · Phase 12 `b5fd76d` · Phase 14 `73f5e20` · workflow
 integration `6fcf672` · Phase 13 `14a42cb` · Phase 15 `52e2a5e`, `b5078b8` · Phase 16 `a0c22a2` ·
-README `d1b7de2`. Everything after `dc31bc1` is committed locally and not pushed (`main` is 12
+README `d1b7de2`. Everything after `dc31bc1` is committed locally and not pushed (`main` is 20
 commits ahead of `origin/main`).
 
 ---
@@ -1666,17 +1745,22 @@ commits ahead of `origin/main`).
 | `escalate` / `monitor` / `resolve` take no action | Open | They record `next_step` and a trace outcome. Nothing is paged, ticketed or closed. Remediation exists (Phase 11) but is simulated |
 | No way to approve a HIGH-risk step | **Open, most important gap** | `GuardedPlan.approve()` exists and the executor honours it, but no API route, CLI command or queue calls it. HIGH steps stay PENDING, are always skipped, and verification then reports SKIPPED |
 | Verification is injected, not causal | Open | RECOVERED depends on the `post_remediation_scenario` argument (API default `HEALTHY`); the mock executor changes nothing. No retry or re-investigation loop although `MAX_VERIFICATION_ATTEMPTS = 2` exists |
-| CI fails on the live-LLM test | Open, defect | `test_assess_severity_live` has no skip guard and CI has no API key. Needs a skip condition or a marker excluded in CI |
-| `ruff format --check` covers a hand-picked file list | Open | Lint covers everything; the format check does not |
+| CI fails on the live-LLM test | Resolved | The test skips without a key and has a `live` marker (`12e67b8`) |
+| `ruff format --check` covers a hand-picked file list | Resolved | Now `ruff format --check .` after a mechanical reformat (`d39079a`) |
+| Default OpenRouter model returns 404 | **Open, blocks live use** | `nvidia/nemotron-3-super-120b-a12b:free` is still listed but the upstream provider answers `Function '...': Not found for account`. Live runs and the app's default model fail until another free model is chosen, which also spends the 50 requests/day quota |
+| CI's PostgreSQL service not yet exercised | Open | The workflow adds `postgres:16` and `DATABASE_URL`; GitHub Actions was not run, so whether the live tests pass there is unconfirmed |
 | Docker image never built or run | Open | Image size unmeasured; `sentence-transformers` is a heavy dependency; memory directory is not a volume |
-| Postgres migrations never run against a database | Open | The one live test skips without a configured server |
-| Persistence is unconnected | Open | Repository protocol and in-memory implementation exist; no Postgres implementation, and neither API nor workflow writes to it. `psycopg` is declared and unused |
-| `domain/persistence.py` imports `api.schemas` | Open | Domain depends on the API layer, which inverts the rule in section 3 |
+| Postgres verified on one build only | Partly resolved | Migrations and the repository pass against an embedded PostgreSQL 16.2 (`pgserver`, Windows). Not run on Docker, a managed service, or other versions |
+| Persistence unconnected | Resolved for the API | `POST /incidents` saves and `GET /incidents/{id}` reads (`56813a4`). The workflow itself, the CLI and the evaluation runner do not write to a repository |
+| `domain/persistence.py` imports `api.schemas` | Resolved | Summaries moved to `domain/summaries.py` (`eaad8fd`) |
+| Re-saving an incident overwrites `created_at` | Open, by parity | Both repositories do it. `POST /incidents` rebuilds the record each time, so resubmitting an `incident_id` rewrites its `created_at` |
+| No connection pooling, no list endpoint | Open | One connection per repository operation; only `GET /incidents/{id}` reads records back |
+| In-memory fallback is not an audit trail | Open | Without `DATABASE_URL` the API stores runs in process memory, lost on restart |
 | Tracer failures are swallowed | Open | Workflow nodes use `try/except Exception: pass` around tracing; a tracer bug is silent |
 | Learned memory can record simulated success as fact | Open | An entry can read "Recovery: verified recovered" for a remediation that did nothing. Still `learned` and unverified at retrieval |
 | API has no auth, rate limiting or async handling | Open | `POST /incidents` runs the whole workflow, including LLM calls, synchronously in the handler |
 | Evaluation measures the pipeline, not the model | Open | 9 golden cases with stubbed LLM steps; nothing scores live-model narrative accuracy or tracks regression |
-| Nothing after `dc31bc1` is pushed | Open | `main` is 12 commits ahead of `origin/main` |
+| Nothing after `dc31bc1` is pushed | Open | `main` is 20 commits ahead of `origin/main` |
 | `AVAILABLE_SERVICES` mutability | Minor | `list` → `tuple` would prevent accidental mutation |
 | Linter / formatter | Resolved (partly) | `ruff` configured and lint passes; see the format-check gap above |
 | Git author identity | Unconfigured | Commits carry an auto-guessed name/email on a public repo |
@@ -1711,8 +1795,8 @@ commits ahead of `origin/main`).
 | 13 | Evaluation — 9 golden cases over the stubbed pipeline; no model-quality scoring | 🚧 |
 | 14 | Observability — spans, JSON logs, redaction; no token counts, no trace retrieval | 🚧 |
 | 15 | Production — API, config, CLI, Docker, CI done; Docker unbuilt, CI has a defect; K8s, AWS, Terraform not started | 🚧 |
-| 16 | Persistence — contract, in-memory repo, migrations; not wired, no Postgres implementation | 🚧 |
-| — | **Approval surface** (route or CLI to approve/reject pending steps) | ⬜ next |
+| 16 | Persistence — PostgreSQL repository, migrations, API saves and reads runs; verified on one embedded build, not in CI yet; workflow/CLI do not write | 🚧 |
+| — | **Approval surface** (route or CLI to approve/reject pending steps), now able to build on persistence | ⬜ next |
 
 **Guardrail model, implemented in Phase 10:**
 
@@ -1815,3 +1899,10 @@ Extracted from decisions actually made in this project, not aspirational:
 32. **A log that trails the code is worse than no log.** Phases 11-16 landed while this file still
     said Phase 10, so the roadmap actively misled. Entries are written from the code and cite the
     commit that introduced each piece, so a reader can check them.
+33. **A test that feeds a mapper stand-ins cannot catch a field the real type lacks.** The incident
+    record mapper read attributes `RemediationStep` never had, and every test passed because none of
+    them used a real step. Build inputs from the real producers (planner, guardrail, executor), at
+    least once, at the seam between two modules.
+34. **A fake can prove your logic and nothing about your SQL.** The fake-connection tests accept any
+    string; only a run against a real server shows the SQL is valid. Say which evidence is which, and
+    run the real one before calling persistence done.
