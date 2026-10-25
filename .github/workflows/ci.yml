@@ -34,7 +34,7 @@ jobs:
         run: uv run ruff check .
 
       - name: Run Ruff Format Check
-        run: uv run ruff format --check src/agentic_ai/config.py src/agentic_ai/api src/agentic_ai/cli.py src/agentic_ai/domain/persistence.py src/agentic_ai/persistence tests/test_config.py tests/test_api.py tests/test_cli.py tests/test_persistence.py tests/test_migrations.py
+        run: uv run ruff format --check .
 
       - name: Run Automated Test Suite
         env:

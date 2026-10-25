@@ -32,6 +32,11 @@ dev = [
     "ruff>=0.17.1",
 ]
 
+[tool.pytest.ini_options]
+markers = [
+    "live: calls a real LLM provider; skipped when no credentials are configured",
+]
+
 [tool.ruff]
 target-version = "py310"
 line-length = 100

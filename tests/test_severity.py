@@ -28,6 +28,24 @@ def test_invalid_severity_is_rejected():
         )
 
 
+def _skip_unless_live_provider_is_configured() -> None:
+    """Skip, rather than fail, when there is no way to reach a real model.
+
+    CI and fresh checkouts have no OpenRouter key; a missing credential is not a
+    defect in the code under test. The key may live in a gitignored ``.env``,
+    which the provider module loads at import time, so load it the same way.
+    """
+    import os
+
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    provider = os.environ.get("LLM_PROVIDER", "openrouter").strip().lower()
+    if provider == "openrouter" and not os.environ.get("OPENROUTER_API_KEY"):
+        pytest.skip("OPENROUTER_API_KEY is not set; live LLM test not run.")
+
+
+@pytest.mark.live
 def test_assess_severity_live():
     """End-to-end against the real configured LLM provider.
 
@@ -36,6 +54,8 @@ def test_assess_severity_live():
     label made the suite fail at random, which trains you to ignore failures.
     What matters for routing is that a total outage lands in the severe band.
     """
+    _skip_unless_live_provider_is_configured()
+
     assessment = assess_severity("Database is completely down and all customers are affected.")
 
     assert isinstance(assessment, SeverityAssessment)
@@ -63,3 +83,22 @@ def test_invalid_llm_output_retries_and_raises_custom_error():
 
     assert fake.calls == 2
     assert isinstance(exc_info.value.__cause__, ValidationError)
+
+
+def test_live_test_is_skipped_when_no_openrouter_key_is_configured(monkeypatch):
+    """The CI guard itself: no credential means skip, never fail."""
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    # A developer's real .env must not leak a key into this check.
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *args, **kwargs: False)
+
+    with pytest.raises(pytest.skip.Exception):
+        _skip_unless_live_provider_is_configured()
+
+
+def test_live_guard_does_not_skip_when_a_key_is_present(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *args, **kwargs: False)
+
+    _skip_unless_live_provider_is_configured()
