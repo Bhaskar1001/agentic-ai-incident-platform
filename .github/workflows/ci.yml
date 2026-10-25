@@ -55,5 +55,19 @@ jobs:
           LLM_PROVIDER: openrouter
           LOG_LEVEL: INFO
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
-        run: uv run pytest -v
+        run: |
+          set -o pipefail
+          uv run pytest -v -rfE --tb=short 2>&1 | tee pytest-output.txt
+
+      # The job log needs repository admin rights to download; annotations are readable by anyone
+      # who can see the run. So when the suite fails, say which tests failed and why, there.
+      - name: Report test failures as annotations
+        if: failure()
+        run: |
+          failed=$(grep -E '^(FAILED|ERROR) ' pytest-output.txt | head -30 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')
+          echo "::error title=Failing tests::${failed:-no FAILED/ERROR lines found; see the log}"
+          detail=$(grep -nE '^(E  |tests/.*(Error|Exception))' pytest-output.txt | head -40 | cut -c1-220 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')
+          echo "::error title=First failure details::${detail:-none captured}"
+          summary=$(tail -n 5 pytest-output.txt | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')
+          echo "::error title=pytest summary::${summary}"
 
