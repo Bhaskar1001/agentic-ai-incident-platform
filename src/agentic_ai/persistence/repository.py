@@ -8,11 +8,14 @@ PostgreSQL, etc.).
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import AbstractContextManager
 from typing import Protocol, runtime_checkable
 
 from agentic_ai.domain.approvals import ApprovalRecord
 from agentic_ai.domain.guardrails import ApprovalState
 from agentic_ai.domain.persistence import IncidentLifecycleStatus, IncidentRecord
+from agentic_ai.domain.plan_snapshots import PlanSnapshot
+from agentic_ai.domain.step_executions import StepExecutionRecord, StepExecutionStatus
 
 
 class IncidentPersistenceError(Exception):
@@ -54,6 +57,19 @@ class ApprovalConflictError(IncidentPersistenceError):
     Already decided, the incident is closed, or the remediation plan it referred
     to was replaced. Never overwritten, never retried.
     """
+
+
+class ExecutionNotFoundError(IncidentPersistenceError):
+    """No such execution record for that incident."""
+
+    def __init__(self, incident_id: str, execution_id: str) -> None:
+        super().__init__(f"Execution '{execution_id}' not found for incident '{incident_id}'.")
+        self.incident_id = incident_id
+        self.execution_id = execution_id
+
+
+class ExecutionConflictError(IncidentPersistenceError):
+    """An execution record cannot make that transition (it is already finished)."""
 
 
 @runtime_checkable
@@ -216,17 +232,109 @@ class ApprovalRepository(Protocol):
 
 
 @runtime_checkable
-class IncidentStore(IncidentRepository, ApprovalRepository, Protocol):
-    """What the API needs: incident records and their approvals in one store."""
+class PlanSnapshotRepository(Protocol):
+    """Immutable storage for the plan an approval was given for."""
+
+    def save_plan_snapshot(self, snapshot: PlanSnapshot) -> PlanSnapshot:
+        """Store a snapshot. Never overwrites.
+
+        Saving the same ``(incident, plan, checksum)`` again returns the stored one; a
+        different checksum for the same plan is stored as a new snapshot.
+
+        Raises
+        ------
+        IncidentNotFoundError
+            If the incident is not stored.
+        """
+        ...
+
+    def get_plan_snapshot(self, incident_id: str, plan_fingerprint: str) -> PlanSnapshot | None:
+        """The most recent snapshot of that plan for that incident, or None.
+
+        **Verified on load**: a snapshot whose content no longer matches its checksum or
+        plan fingerprint raises ``SnapshotIntegrityError`` rather than being returned.
+        """
+        ...
+
+
+@runtime_checkable
+class ExecutionLedger(Protocol):
+    """Durable record of which steps were attempted, claimed before they run."""
+
+    def claim_step_execution(self, record: StepExecutionRecord) -> tuple[StepExecutionRecord, bool]:
+        """Atomically record intent to run a step, if nobody has.
+
+        Returns ``(stored_record, claimed)``. ``claimed`` is True only for the caller whose
+        ``record`` was stored; otherwise ``stored_record`` is the existing one and the
+        caller must not run the step. At most one record exists per
+        ``(incident, plan, step)``, ever.
+        """
+        ...
+
+    def complete_step_execution(
+        self,
+        incident_id: str,
+        execution_id: str,
+        status: StepExecutionStatus,
+        output: str | None = None,
+        error: str | None = None,
+    ) -> StepExecutionRecord:
+        """Finish a started execution as succeeded or failed. Never rewrites a finished one.
+
+        Raises
+        ------
+        ExecutionNotFoundError
+            If there is no such record for that incident.
+        ExecutionConflictError
+            If it is already finished.
+        """
+        ...
+
+    def list_step_executions(
+        self, incident_id: str, plan_fingerprint: str | None = None
+    ) -> list[StepExecutionRecord]:
+        """An incident's execution records (optionally for one plan), by step then time."""
+        ...
+
+
+@runtime_checkable
+class ResumeLocking(Protocol):
+    """Mutual exclusion for resuming one incident."""
+
+    def resume_lock(self, incident_id: str) -> AbstractContextManager[bool]:
+        """Try, without waiting, to become the only resumer of ``incident_id``.
+
+        Yields True if acquired (held until the block exits) and False if another resume
+        holds it. For PostgreSQL this is a session advisory lock, so it is released
+        automatically if the process dies.
+        """
+        ...
+
+
+@runtime_checkable
+class IncidentStore(
+    IncidentRepository,
+    ApprovalRepository,
+    PlanSnapshotRepository,
+    ExecutionLedger,
+    ResumeLocking,
+    Protocol,
+):
+    """What the API needs: incident records, approvals, stored plans and the ledger."""
 
 
 __all__ = [
     "ApprovalConflictError",
     "ApprovalNotFoundError",
     "ApprovalRepository",
+    "ExecutionConflictError",
+    "ExecutionLedger",
+    "ExecutionNotFoundError",
     "IncidentConflictError",
     "IncidentNotFoundError",
     "IncidentPersistenceError",
     "IncidentRepository",
     "IncidentStore",
+    "PlanSnapshotRepository",
+    "ResumeLocking",
 ]

@@ -15,6 +15,7 @@ validation and retry logic still run.
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -29,10 +30,15 @@ from agentic_ai.domain.investigation import (
 )
 from agentic_ai.domain.persistence import IncidentRecord
 from agentic_ai.domain.rca import KnowledgeBaseConsistency, RootCauseAnalysis
-from agentic_ai.domain.remediation import RemediationPlan, RemediationStep
+from agentic_ai.domain.remediation import (
+    ExecutionStatus,
+    RemediationPlan,
+    RemediationStep,
+    StepExecutionResult,
+)
 from agentic_ai.llm.client import ChatResponse
 from agentic_ai.llm.severity import SeverityAssessment
-from agentic_ai.tools.mock_remediation import execute_guarded_plan
+from agentic_ai.tools.mock_remediation import execute_guarded_plan, execute_mock_remediation_step
 from agentic_ai.tools.mock_tools import Scenario, get_mock_metrics, get_mock_pod_status
 from agentic_ai.workflows import incident as workflow_module
 
@@ -158,3 +164,55 @@ def install_pipeline_stubs(monkeypatch) -> PipelineConfig:
     )
     monkeypatch.setattr("agentic_ai.llm.remediation.get_client", lambda: _PlannerClient(config))
     return config
+
+
+# --- Phase 18: submitting through the ledger, resuming, and breaking things on purpose ------
+
+HEALTHY = Scenario.HEALTHY.value
+STILL_BROKEN = Scenario.CONNECTION_POOL_EXHAUSTION.value
+
+
+class CountingExecutor:
+    """A step executor that counts what it was asked to run, and can misbehave on cue.
+
+    ``fail_steps`` makes those action types return FAILED; ``raise_on`` makes them raise
+    ``raise_with`` (use a BaseException subclass to simulate the process dying).
+    """
+
+    def __init__(self, *, fail_actions=(), raise_on=(), raise_with=RuntimeError, delay=0.0):
+        self.calls: list[tuple[str, str]] = []
+        self._delay = delay
+        self._fail_actions = set(fail_actions)
+        self._raise_on = set(raise_on)
+        self._raise_with = raise_with
+
+    def __call__(self, step: RemediationStep) -> StepExecutionResult:
+        action = getattr(step.action_type, "value", str(step.action_type))
+        self.calls.append((action, step.target_service))
+        if self._delay:
+            time.sleep(self._delay)  # long enough for concurrent callers to overlap
+        if action in self._raise_on:
+            raise self._raise_with(f"simulated failure of {action}")
+        if action in self._fail_actions:
+            return StepExecutionResult(
+                step=step,
+                status=ExecutionStatus.FAILED,
+                output=f"[SIMULATED] {action} failed",
+                error="simulated failure",
+            )
+        return execute_mock_remediation_step(step)
+
+
+class WrappedStore:
+    """The real store with selected operations replaced; everything else delegates."""
+
+    def __init__(self, store, **overrides):
+        self._store = store
+        self._overrides = overrides
+
+    def __getattr__(self, name):
+        return self._overrides.get(name) or getattr(self._store, name)
+
+
+def boom(*args, **kwargs):
+    raise RuntimeError("database down")

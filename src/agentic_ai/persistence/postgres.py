@@ -21,8 +21,11 @@ test in ``tests/test_postgres_repository.py``.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from typing import Any
+
+from pydantic import ValidationError
 
 from agentic_ai.domain.approvals import (
     ApprovalDecisionError,
@@ -39,10 +42,20 @@ from agentic_ai.domain.persistence import (
     IncidentRemediationRecord,
     IncidentStageRecord,
 )
+from agentic_ai.domain.plan_snapshots import PlanSnapshot, SnapshotIntegrityError, SnapshotStep
+from agentic_ai.domain.rca import KnowledgeBaseConsistency
+from agentic_ai.domain.step_executions import (
+    ExecutionSource,
+    StepExecutionError,
+    StepExecutionRecord,
+    StepExecutionStatus,
+)
 from agentic_ai.domain.summaries import DiagnosticSummary, VerificationSummary
 from agentic_ai.persistence.repository import (
     ApprovalConflictError,
     ApprovalNotFoundError,
+    ExecutionConflictError,
+    ExecutionNotFoundError,
     IncidentConflictError,
     IncidentNotFoundError,
     IncidentPersistenceError,
@@ -109,6 +122,27 @@ ON CONFLICT (incident_id, plan_fingerprint, step_index) DO NOTHING
 # step_index in its ordering so that it matches the partial index exactly.
 _APPROVAL_ORDER = "ORDER BY requested_at, step_index, approval_id"
 _PENDING_QUEUE_ORDER = "ORDER BY requested_at, approval_id"
+
+_SNAPSHOT_COLUMNS = (
+    "snapshot_id, incident_id, plan_fingerprint, snapshot_version, checksum, content, created_at"
+)
+
+_INSERT_SNAPSHOT = f"""
+INSERT INTO incident_plan_snapshots ({_SNAPSHOT_COLUMNS})
+VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
+ON CONFLICT (incident_id, plan_fingerprint, checksum) DO NOTHING
+"""
+
+_EXECUTION_COLUMNS = (
+    "execution_id, incident_id, plan_fingerprint, step_index, step_fingerprint, action_type, "
+    "target_service, status, source, started_at, finished_at, output, error"
+)
+
+_CLAIM_EXECUTION = f"""
+INSERT INTO incident_step_executions ({_EXECUTION_COLUMNS})
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+ON CONFLICT (incident_id, plan_fingerprint, step_index) DO NOTHING
+"""
 
 
 def _json_value(value: Any) -> Any:
@@ -481,6 +515,234 @@ class PostgresIncidentRepository:
             decision_reason=row[12],
         )
 
+    # -- plan snapshots ---------------------------------------------------------
+
+    def save_plan_snapshot(self, snapshot: PlanSnapshot) -> PlanSnapshot:
+        content = {
+            "steps": [s.model_dump() for s in snapshot.steps],
+            "root_cause": snapshot.root_cause,
+            "root_cause_confidence": snapshot.root_cause_confidence,
+            "knowledge_base_consistency": snapshot.knowledge_base_consistency.value,
+            "investigated_services": snapshot.investigated_services,
+        }
+
+        def work(cur: Any) -> PlanSnapshot:
+            cur.execute(
+                "SELECT 1 FROM incidents WHERE incident_id = %s FOR KEY SHARE",
+                (snapshot.incident_id,),
+            )
+            if cur.fetchone() is None:
+                raise IncidentNotFoundError(snapshot.incident_id)
+            cur.execute(
+                _INSERT_SNAPSHOT,
+                (
+                    snapshot.snapshot_id,
+                    snapshot.incident_id,
+                    snapshot.plan_fingerprint,
+                    snapshot.version,
+                    snapshot.checksum,
+                    json.dumps(content),
+                    snapshot.created_at,
+                ),
+            )
+            # Re-read: if this exact presentation was already stored, the original wins.
+            cur.execute(
+                f"SELECT {_SNAPSHOT_COLUMNS} FROM incident_plan_snapshots "
+                "WHERE incident_id = %s AND plan_fingerprint = %s AND checksum = %s",
+                (snapshot.incident_id, snapshot.plan_fingerprint, snapshot.checksum),
+            )
+            return self._row_to_snapshot(cur.fetchone())
+
+        return self._in_transaction(work)
+
+    def get_plan_snapshot(self, incident_id: str, plan_fingerprint: str) -> PlanSnapshot | None:
+        def work(cur: Any) -> PlanSnapshot | None:
+            cur.execute(
+                f"SELECT {_SNAPSHOT_COLUMNS} FROM incident_plan_snapshots "
+                "WHERE incident_id = %s AND plan_fingerprint = %s "
+                "ORDER BY snapshot_seq DESC LIMIT 1",
+                (incident_id, plan_fingerprint),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            snapshot = self._row_to_snapshot(row)
+            snapshot.verify()  # never hand back a plan that fails its own checks
+            return snapshot
+
+        return self._in_transaction(work)
+
+    @staticmethod
+    def _row_to_snapshot(row: Any) -> PlanSnapshot:
+        try:
+            content = _json_value(row[5])
+            return PlanSnapshot(
+                snapshot_id=row[0],
+                incident_id=row[1],
+                plan_fingerprint=row[2],
+                version=row[3],
+                steps=[SnapshotStep(**step) for step in content["steps"]],
+                root_cause=content.get("root_cause", ""),
+                root_cause_confidence=content["root_cause_confidence"],
+                knowledge_base_consistency=KnowledgeBaseConsistency(
+                    content["knowledge_base_consistency"]
+                ),
+                investigated_services=list(content["investigated_services"]),
+                checksum=row[4],
+                created_at=row[6],
+            )
+        except (ValidationError, KeyError, TypeError, ValueError) as exc:
+            raise SnapshotIntegrityError("Stored plan snapshot content is malformed.") from exc
+
+    # -- execution ledger ---------------------------------------------------------
+
+    def claim_step_execution(self, record: StepExecutionRecord) -> tuple[StepExecutionRecord, bool]:
+        def work(cur: Any) -> tuple[StepExecutionRecord, bool]:
+            # A concurrent claim blocks on the unique index until the first one commits,
+            # then does nothing: exactly one caller gets rowcount 1 for a given step.
+            cur.execute(
+                _CLAIM_EXECUTION,
+                (
+                    record.execution_id,
+                    record.incident_id,
+                    record.plan_fingerprint,
+                    record.step_index,
+                    record.step_fingerprint,
+                    record.action_type,
+                    record.target_service,
+                    record.status.value,
+                    record.source.value,
+                    record.started_at,
+                    record.finished_at,
+                    record.output,
+                    record.error,
+                ),
+            )
+            claimed = cur.rowcount == 1
+            cur.execute(
+                f"SELECT {_EXECUTION_COLUMNS} FROM incident_step_executions "
+                "WHERE incident_id = %s AND plan_fingerprint = %s AND step_index = %s",
+                (record.incident_id, record.plan_fingerprint, record.step_index),
+            )
+            return self._row_to_execution(cur.fetchone()), claimed
+
+        return self._in_transaction(work)
+
+    def complete_step_execution(
+        self,
+        incident_id: str,
+        execution_id: str,
+        status: StepExecutionStatus,
+        output: str | None = None,
+        error: str | None = None,
+    ) -> StepExecutionRecord:
+        def work(cur: Any) -> StepExecutionRecord:
+            cur.execute(
+                f"SELECT {_EXECUTION_COLUMNS} FROM incident_step_executions "
+                "WHERE incident_id = %s AND execution_id = %s FOR UPDATE",
+                (incident_id, execution_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ExecutionNotFoundError(incident_id, execution_id)
+            try:
+                finished = self._row_to_execution(row).finish(status, output, error)
+            except StepExecutionError as exc:
+                raise ExecutionConflictError(str(exc)) from exc
+
+            cur.execute(
+                "UPDATE incident_step_executions SET status = %s, finished_at = %s, "
+                "output = %s, error = %s WHERE execution_id = %s AND status = 'started'",
+                (finished.status.value, finished.finished_at, output, error, execution_id),
+            )
+            if cur.rowcount != 1:
+                raise ExecutionConflictError(
+                    f"Execution '{execution_id}' was finished by a concurrent request."
+                )
+            return finished
+
+        return self._in_transaction(work)
+
+    def list_step_executions(
+        self, incident_id: str, plan_fingerprint: str | None = None
+    ) -> list[StepExecutionRecord]:
+        def work(cur: Any) -> list[StepExecutionRecord]:
+            if plan_fingerprint is None:
+                cur.execute(
+                    f"SELECT {_EXECUTION_COLUMNS} FROM incident_step_executions "
+                    "WHERE incident_id = %s ORDER BY step_index, started_at",
+                    (incident_id,),
+                )
+            else:
+                cur.execute(
+                    f"SELECT {_EXECUTION_COLUMNS} FROM incident_step_executions "
+                    "WHERE incident_id = %s AND plan_fingerprint = %s "
+                    "ORDER BY step_index, started_at",
+                    (incident_id, plan_fingerprint),
+                )
+            return [self._row_to_execution(r) for r in cur.fetchall()]
+
+        return self._in_transaction(work)
+
+    @staticmethod
+    def _row_to_execution(row: Any) -> StepExecutionRecord:
+        return StepExecutionRecord(
+            execution_id=row[0],
+            incident_id=row[1],
+            plan_fingerprint=row[2],
+            step_index=row[3],
+            step_fingerprint=row[4],
+            action_type=row[5],
+            target_service=row[6],
+            status=StepExecutionStatus(row[7]),
+            source=ExecutionSource(row[8]),
+            started_at=row[9],
+            finished_at=row[10],
+            output=row[11],
+            error=row[12],
+        )
+
+    # -- resume lock ----------------------------------------------------------------
+
+    @contextmanager
+    def resume_lock(self, incident_id: str) -> Iterator[bool]:
+        """A session-level advisory lock, so a crashed resumer cannot leave it held.
+
+        It lives on its own connection for the whole ``with`` block: the operations done
+        inside use their own short transactions on other connections.
+        """
+        key = f"resume:{incident_id}"
+        connection = self._connect()
+        acquired = False
+        try:
+            try:
+                cursor = connection.cursor()
+                try:
+                    cursor.execute("SELECT pg_try_advisory_lock(hashtextextended(%s, 0))", (key,))
+                    acquired = bool(cursor.fetchone()[0])
+                finally:
+                    cursor.close()
+                connection.commit()
+            except Exception as exc:
+                connection.rollback()
+                raise IncidentPersistenceError(f"Could not take the resume lock: {exc}") from exc
+            yield acquired
+        finally:
+            try:
+                if acquired:
+                    cursor = connection.cursor()
+                    try:
+                        cursor.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))", (key,))
+                    finally:
+                        cursor.close()
+                    connection.commit()
+            except Exception:
+                # Best effort: closing the connection below releases a session lock anyway,
+                # and a failure to unlock must not mask the outcome of the resume itself.
+                pass
+            finally:
+                connection.close()
+
     # -- internals ------------------------------------------------------------
 
     def _in_transaction(self, work: Callable[[Any], Any]) -> Any:
@@ -499,7 +761,7 @@ class PostgresIncidentRepository:
                 cursor.close()
             connection.commit()
             return result
-        except (IncidentPersistenceError, ValueError):
+        except (IncidentPersistenceError, SnapshotIntegrityError, ValueError):
             # Domain outcomes (conflict, not found) and bad arguments are not driver
             # failures: roll back and let the caller see them as they are.
             connection.rollback()

@@ -211,7 +211,8 @@ def test_apply_migrations_idempotency_when_already_applied() -> None:
 
 
 def test_apply_migrations_upgrades_a_database_that_only_has_001() -> None:
-    """The approvals migration is picked up by a database created before it existed."""
+    """Later migrations (approvals, then plan snapshots and the ledger) are picked up, in
+    order, by a database created before they existed."""
     runner = MigrationRunner()
     conn = MockConnection()
     m001 = runner.discover_migrations()[0]
@@ -221,7 +222,7 @@ def test_apply_migrations_upgrades_a_database_that_only_has_001() -> None:
 
     applied = runner.apply_migrations(conn)
 
-    assert [m.version for m in applied] == ["002"]
+    assert [m.version for m in applied] == ["002", "003"]
     assert conn.rollbacks == 0
 
 
@@ -307,3 +308,27 @@ def test_live_postgresql_execution() -> None:
             assert isinstance(applied, list)
     except Exception as exc:
         pytest.skip(f"Could not connect to configured PostgreSQL instance: {exc}")
+
+
+def test_migration_003_defines_snapshots_and_the_ledger() -> None:
+    sql = {m.version: m.sql for m in MigrationRunner().discover_migrations()}["003"]
+
+    # Snapshots: tied to the incident (restricting deletion), unique per presentation, immutable,
+    # and "latest" decided by a sequence rather than a timestamp.
+    assert "CREATE TABLE IF NOT EXISTS incident_plan_snapshots" in sql
+    assert "REFERENCES incidents(incident_id) ON DELETE RESTRICT" in sql
+    assert "UNIQUE (incident_id, plan_fingerprint, checksum)" in sql
+    assert "snapshot_seq BIGINT GENERATED ALWAYS AS IDENTITY" in sql
+    assert "BEFORE UPDATE ON incident_plan_snapshots" in sql and "immutable" in sql
+
+    # Ledger: one row per step ever, a lifecycle check, finished rows never rewritten ...
+    assert "CREATE TABLE IF NOT EXISTS incident_step_executions" in sql
+    assert "UNIQUE (incident_id, plan_fingerprint, step_index)" in sql
+    assert "chk_incident_step_executions_lifecycle" in sql
+    assert "forbid_finished_execution_update" in sql
+    # ... and deliberately no foreign key to incidents (an execution can precede its record).
+    ledger_ddl = sql.split("CREATE TABLE IF NOT EXISTS incident_step_executions")[1].split(");")[0]
+    assert "REFERENCES" not in ledger_ddl
+
+    # Re-runnable.
+    assert "DROP TRIGGER IF EXISTS" in sql and "CREATE OR REPLACE FUNCTION" in sql

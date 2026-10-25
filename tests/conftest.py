@@ -43,5 +43,9 @@ def incident_store(request):
     yield PostgresIncidentRepository.from_url(database_url)
 
     with psycopg.connect(database_url) as conn:
+        # Children first: approvals and snapshots reference incidents with ON DELETE RESTRICT.
+        # (Ledger rows have no foreign key by design, but belong to the same test data.)
         conn.execute("DELETE FROM incident_approvals WHERE incident_id LIKE 'TEST-APR-%'")
+        conn.execute("DELETE FROM incident_plan_snapshots WHERE incident_id LIKE 'TEST-APR-%'")
+        conn.execute("DELETE FROM incident_step_executions WHERE incident_id LIKE 'TEST-APR-%'")
         conn.execute("DELETE FROM incidents WHERE incident_id LIKE 'TEST-APR-%'")

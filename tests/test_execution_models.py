@@ -47,6 +47,7 @@ def test_execution_status_is_exhaustive() -> None:
         ExecutionStatus.SKIPPED,
         ExecutionStatus.BLOCKED,
         ExecutionStatus.FAILED,
+        ExecutionStatus.UNKNOWN,  # Phase 18: an attempt whose outcome was never recorded
     }
 
 

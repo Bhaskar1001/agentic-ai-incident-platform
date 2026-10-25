@@ -103,6 +103,11 @@ class ExecutionStatus(str, Enum):
     FAILED = "failed"
     """The executor attempted the action and it did not succeed."""
 
+    UNKNOWN = "unknown"
+    """An attempt was recorded as started but its outcome was never recorded (or the
+    executor raised), so whether the action took effect cannot be known. The step is not
+    replayed automatically: replaying a non-idempotent action could do harm."""
+
 
 class StepExecutionResult(BaseModel, frozen=True):
     """The outcome of acting (or declining to act) on one guarded step.

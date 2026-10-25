@@ -7,6 +7,8 @@ demonstrations, and offline validation.
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Sequence
 
 from agentic_ai.domain.approvals import (
@@ -18,9 +20,17 @@ from agentic_ai.domain.approvals import (
 )
 from agentic_ai.domain.guardrails import ApprovalState
 from agentic_ai.domain.persistence import IncidentLifecycleStatus, IncidentRecord
+from agentic_ai.domain.plan_snapshots import PlanSnapshot
+from agentic_ai.domain.step_executions import (
+    StepExecutionError,
+    StepExecutionRecord,
+    StepExecutionStatus,
+)
 from agentic_ai.persistence.repository import (
     ApprovalConflictError,
     ApprovalNotFoundError,
+    ExecutionConflictError,
+    ExecutionNotFoundError,
     IncidentConflictError,
     IncidentNotFoundError,
     IncidentRepository,
@@ -37,6 +47,11 @@ class InMemoryIncidentRepository:
         # (incident, plan fingerprint, step index) -> approval_id: what makes
         # registering approvals idempotent, mirroring the PostgreSQL unique constraint.
         self._approval_keys: dict[tuple[str, str, int], str] = {}
+        # Immutable plan snapshots per (incident, plan fingerprint), in the order stored.
+        self._snapshots: dict[tuple[str, str], list[PlanSnapshot]] = {}
+        # The execution ledger: one record per (incident, plan fingerprint, step index).
+        self._executions: dict[tuple[str, str, int], StepExecutionRecord] = {}
+        self._resume_locks: dict[str, threading.Lock] = {}
         if initial_records:
             for rec in initial_records:
                 self.save_incident(rec)
@@ -199,12 +214,96 @@ class InMemoryIncidentRepository:
             self._approvals[approval_id] = decided
             return decided
 
+    # -- plan snapshots ---------------------------------------------------------
+
+    def save_plan_snapshot(self, snapshot: PlanSnapshot) -> PlanSnapshot:
+        with self._lock:
+            if snapshot.incident_id not in self._storage:
+                raise IncidentNotFoundError(snapshot.incident_id)
+            key = (snapshot.incident_id, snapshot.plan_fingerprint)
+            existing = self._snapshots.setdefault(key, [])
+            for stored in existing:
+                if stored.checksum == snapshot.checksum:
+                    return stored  # the same presentation again: keep the original
+            existing.append(snapshot)
+            return snapshot
+
+    def get_plan_snapshot(self, incident_id: str, plan_fingerprint: str) -> PlanSnapshot | None:
+        with self._lock:
+            stored = self._snapshots.get((incident_id, plan_fingerprint))
+            if not stored:
+                return None
+            # The most recently *stored*, by insertion order, not by timestamp: two
+            # presentations inside one clock tick must not tie.
+            latest = stored[-1]
+        latest.verify()  # raises SnapshotIntegrityError rather than returning a bad plan
+        return latest
+
+    # -- execution ledger -------------------------------------------------------
+
+    def claim_step_execution(self, record: StepExecutionRecord) -> tuple[StepExecutionRecord, bool]:
+        key = (record.incident_id, record.plan_fingerprint, record.step_index)
+        with self._lock:
+            existing = self._executions.get(key)
+            if existing is not None:
+                return existing, False
+            self._executions[key] = record
+            return record, True
+
+    def complete_step_execution(
+        self,
+        incident_id: str,
+        execution_id: str,
+        status: StepExecutionStatus,
+        output: str | None = None,
+        error: str | None = None,
+    ) -> StepExecutionRecord:
+        with self._lock:
+            for key, record in self._executions.items():
+                if record.incident_id == incident_id and record.execution_id == execution_id:
+                    try:
+                        finished = record.finish(status, output, error)
+                    except StepExecutionError as exc:
+                        raise ExecutionConflictError(str(exc)) from exc
+                    self._executions[key] = finished
+                    return finished
+            raise ExecutionNotFoundError(incident_id, execution_id)
+
+    def list_step_executions(
+        self, incident_id: str, plan_fingerprint: str | None = None
+    ) -> list[StepExecutionRecord]:
+        with self._lock:
+            matching = [
+                r
+                for r in self._executions.values()
+                if r.incident_id == incident_id
+                and (plan_fingerprint is None or r.plan_fingerprint == plan_fingerprint)
+            ]
+            matching.sort(key=lambda r: (r.step_index, r.started_at))
+            return matching
+
+    # -- resume lock ------------------------------------------------------------
+
+    @contextmanager
+    def resume_lock(self, incident_id: str) -> Iterator[bool]:
+        with self._lock:
+            lock = self._resume_locks.setdefault(incident_id, threading.Lock())
+        acquired = lock.acquire(blocking=False)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                lock.release()
+
     def clear(self) -> None:
         """Reset internal storage (useful for test fixtures)."""
         with self._lock:
             self._storage.clear()
             self._approvals.clear()
             self._approval_keys.clear()
+            self._snapshots.clear()
+            self._executions.clear()
+            self._resume_locks.clear()
 
 
 # Ensure implementation strictly satisfies protocol at runtime
