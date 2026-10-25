@@ -450,3 +450,45 @@ def test_database_url_invalid_scheme(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(ValidationError, match="DATABASE_URL must use postgresql"):
         Settings(database_url="sqlite:///test.db")
+
+
+def test_from_workflow_state_maps_a_real_guarded_plan_and_execution() -> None:
+    """Regression: the mapping once read ``step_order`` and ``parameters`` off
+    RemediationStep, which has neither, so any real run with a plan crashed.
+    Built from the real planner, guardrail and executor objects, not stand-ins.
+    """
+    from agentic_ai.domain.guardrails import guard_plan
+    from agentic_ai.domain.rca import KnowledgeBaseConsistency, RootCauseAnalysis
+    from agentic_ai.domain.remediation import RemediationPlan, RemediationStep
+    from agentic_ai.tools.mock_remediation import execute_guarded_plan
+
+    plan = RemediationPlan(
+        steps=[
+            RemediationStep(action_type="scale_up", target_service="payment", rationale="r"),
+            RemediationStep(
+                action_type="rollback_deployment", target_service="payment", rationale="r"
+            ),
+        ]
+    )
+    analysis = RootCauseAnalysis(
+        root_cause="x",
+        root_cause_confidence=0.9,
+        knowledge_base_consistency=KnowledgeBaseConsistency.SUPPORTED,
+    )
+    guarded = guard_plan(plan, analysis, {"payment"})
+
+    record = IncidentRecord.from_workflow_state(
+        {
+            "incident_description": "d",
+            "guarded_plan": guarded,
+            "remediation_execution": execute_guarded_plan(guarded),
+            "next_step": "escalate",
+        }
+    )
+
+    assert [r.step_order for r in record.remediations] == [0, 1]
+    assert record.remediations[0].execution_status == "executed"
+    assert record.remediations[0].disposition == "allowed"
+    # HIGH risk and unapproved: skipped, with its disposition preserved.
+    assert record.remediations[1].execution_status == "skipped"
+    assert record.remediations[1].disposition == "requires_approval"

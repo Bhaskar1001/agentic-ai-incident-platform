@@ -17,8 +17,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from agentic_ai.api.schemas import DiagnosticSummary, VerificationSummary
 from agentic_ai.domain.incident import Severity
+from agentic_ai.domain.summaries import DiagnosticSummary, VerificationSummary
 from agentic_ai.observability.redaction import sanitize_dict
 
 
@@ -229,38 +229,32 @@ class IncidentRecord(BaseModel):
                     )
                 )
 
-        # Extract remediations
+        # Extract remediations. ``execute_guarded_plan`` returns exactly one result per
+        # guarded step, in plan order, so a step's position in the plan is both its
+        # ``step_order`` and the index of its execution result. (RemediationStep itself
+        # carries no order or parameters, so neither is read from it.)
         remediations: list[IncidentRemediationRecord] = []
         guarded_plan = state.get("guarded_plan")
         rem_exec = state.get("remediation_execution")
 
-        exec_results_by_order: dict[int, Any] = {}
+        exec_results: list[Any] = []
         if rem_exec is not None and getattr(rem_exec, "step_results", None):
-            for res in rem_exec.step_results:
-                exec_results_by_order[res.step.step_order] = res
+            exec_results = list(rem_exec.step_results)
 
         if guarded_plan is not None and getattr(guarded_plan, "steps", None):
-            for g_step in guarded_plan.steps:
-                step_order = g_step.step.step_order
+            for index, g_step in enumerate(guarded_plan.steps):
                 action_type = (
                     g_step.step.action_type.value
                     if hasattr(g_step.step.action_type, "value")
                     else str(g_step.step.action_type)
                 )
-                target_service = g_step.step.target_service
                 disposition = (
                     g_step.disposition.value
                     if hasattr(g_step.disposition, "value")
                     else str(g_step.disposition)
                 )
-                raw_params = (
-                    g_step.step.parameters
-                    if hasattr(g_step.step, "parameters")
-                    and isinstance(g_step.step.parameters, dict)
-                    else {}
-                )
 
-                exec_res = exec_results_by_order.get(step_order)
+                exec_res = exec_results[index] if index < len(exec_results) else None
                 if exec_res is not None:
                     exec_status = (
                         exec_res.status.value
@@ -274,12 +268,12 @@ class IncidentRecord(BaseModel):
 
                 remediations.append(
                     IncidentRemediationRecord(
-                        step_order=step_order,
+                        step_order=index,
                         action_type=action_type,
-                        target_service=target_service,
+                        target_service=g_step.step.target_service,
                         disposition=disposition,
                         execution_status=exec_status,
-                        parameters=raw_params,
+                        parameters={},
                         output=output,
                     )
                 )

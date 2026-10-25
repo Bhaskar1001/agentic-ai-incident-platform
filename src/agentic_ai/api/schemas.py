@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agentic_ai.observability.events import IncidentTrace
 from agentic_ai.tools.mock_tools import Scenario
+from agentic_ai.domain.summaries import DiagnosticSummary, VerificationSummary
 
 
 class HealthResponse(BaseModel):
@@ -81,26 +82,6 @@ class IncidentRequest(BaseModel):
         return cleaned
 
 
-class DiagnosticSummary(BaseModel):
-    """High-level summary of the workflow's terminal diagnostic decision."""
-
-    decision: str
-    trigger_type: str
-    primary_reason: str
-
-    model_config = ConfigDict(frozen=True)
-
-
-class VerificationSummary(BaseModel):
-    """High-level summary of the post-remediation verification results."""
-
-    status: str
-    attempts: int
-    reasons: list[str]
-
-    model_config = ConfigDict(frozen=True)
-
-
 class IncidentResponse(BaseModel):
     """Structured response returned upon completing incident triage and resolution."""
 
@@ -111,6 +92,9 @@ class IncidentResponse(BaseModel):
     diagnostic: DiagnosticSummary | None = None
     verification: VerificationSummary | None = None
     trace: IncidentTrace | None = None
+    persisted: bool = False
+    """Whether this run was written to the incident repository. False means the
+    result is valid but the audit record was not saved (see the server logs)."""
 
     model_config = ConfigDict(frozen=True)
 
