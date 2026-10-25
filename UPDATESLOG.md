@@ -3,14 +3,21 @@
 > Single source of truth for this project: what it is, why it exists, what has been built in each
 > phase, and the reasoning behind every significant decision.
 >
-> **Last updated:** 2026-10-10 · **Current phase:** Phase 7 complete — escalating incidents now get
-> a synthesized root cause analysis (primary cause, alternatives, cited findings, knowledge-base
-> consistency), produced as a single structured-output call rather than a second agent loop. The
-> investigation agent from Phase 5 (with the optional knowledge-base retrieval from Phase 6)
-> remains the only looping agent in the system; no Supervisor exists yet, since two steps in a fixed
-> sequence give it no real decision to make. OpenRouter's free-tier rate limit, confirmed twice, is
-> now understood (a 50-request/day account-wide quota) and surfaced with a clear error rather than a
-> generic one. A Remediation Planner is next.
+> **Last updated:** 2026-10-25 · **Current phase:** Phases 1-16 have code and tests (461 passing,
+> 1 skipped). The pipeline now runs end to end: assess, investigate, route on evidence, root cause
+> analysis, remediation plan, guardrails, **simulated** execution, deterministic verification, memory,
+> then resolve or escalate. It is wrapped in a FastAPI service, a demo CLI, structured tracing, a
+> golden-case evaluation harness, a Dockerfile and CI.
+>
+> **Read this before trusting the roadmap:** most of what is "done" is simulated or unconnected.
+> Execution and verification act on mocks; persistence is a contract with no database behind it; no
+> API route can grant a human approval; the Docker image and the Postgres migrations have never been
+> run; and CI will fail on the live-LLM test. See sections 5 and 6 for the full list.
+>
+> The log was stale from 2026-10-16 (Phase 10) to 2026-10-25: Phases 11-16 were written outside the
+> sessions that produced the earlier entries, then reviewed and committed together. Their entries
+> below describe what the code does, not what was originally intended, and cite the commit that
+> introduced each piece.
 
 ---
 
@@ -111,10 +118,13 @@ introduced only when a real problem justifies it, never for its own sake.
 
 ### Planned but deliberately not yet added
 
-`PostgreSQL` (persistence), `pgvector` (RAG), `FastAPI` (API layer), `MCP` (tool protocol), `Docker`
-/ `Kubernetes` / `AWS` / `Terraform` (deployment). **Each will be added only when a concrete need
-arises.** Adding infrastructure before there's a problem it solves is the most common way these
-projects collapse under their own weight.
+`pgvector` (RAG), `Kubernetes` / `AWS` / `Terraform` (deployment). **Each will be added only when a
+concrete need arises.** Adding infrastructure before there's a problem it solves is the most common
+way these projects collapse under their own weight.
+
+Since this table was written, these were added: `mcp` (Phase 9), `fastapi` and `ruff` (Phase 15),
+`psycopg` (Phase 16, declared but not yet imported by any code), and Docker plus GitHub Actions
+(Phase 15). `PostgreSQL` itself is still not running anywhere: only its migration files exist.
 
 ---
 
@@ -128,7 +138,11 @@ src/agentic_ai/
 ├── tools/        The agent's perceptual world — what it can observe
 ├── agents/       Autonomous reasoning: the bounded investigation loop
 ├── workflows/    LangGraph orchestration: state, nodes, edges, routing
-└── api/          (empty) HTTP layer — later phase
+├── api/          FastAPI service: /health, /ready, POST /incidents (Phase 15)
+├── mcp_server/   Read-only MCP server over the investigation tools (Phase 9)
+├── evaluation/   Golden cases, deterministic metrics and safety invariants (Phase 13)
+├── observability/ Tracer, trace models, secret redaction (Phase 14)
+└── persistence/  Repository contract, in-memory repo, SQL migrations (Phase 16)
 ```
 
 **Why these boundaries:**
@@ -1337,6 +1351,169 @@ second decision on the same step.
 
 ---
 
+### Phase 11 — Mock remediation executor ✅ (simulated only) · `0397465`
+
+**Built:** execution-result models in `domain/remediation.py` (`ExecutionStatus` EXECUTED / SKIPPED /
+BLOCKED / FAILED, frozen `StepExecutionResult`, `RemediationExecution`) and
+`tools/mock_remediation.execute_guarded_plan()`.
+
+**What the executor enforces, and it re-checks rather than trusting `may_execute` alone:**
+- A BLOCKED step is never passed to the action function; it is recorded as BLOCKED.
+- A REQUIRES_APPROVAL step runs only if its approval is APPROVED. PENDING and REJECTED are recorded
+  as SKIPPED (a rejection names who rejected it).
+- An ALLOWED step runs only if `may_execute` is true and approval is NOT_REQUIRED.
+- An unknown disposition is treated as BLOCKED, not as permission.
+
+**What "execute" means here:** each action returns a fixed `[SIMULATED] ...` string. Nothing about
+the mock world changes, so executing `restart_service` has no effect on any later tool output.
+
+**Tests:** 16 model tests and 11 executor tests, including the blocked / pending / rejected cases.
+
+**Consequence worth stating plainly:** the workflow executes LOW and validated-MEDIUM steps with no
+human in the loop (that is what the Phase 10 policy says), and HIGH steps stay PENDING for ever
+because nothing in the system can approve them (see Phase 15). So in practice a HIGH step is
+always skipped, verification then reports SKIPPED, and the incident escalates.
+
+---
+
+### Phase 12 — Deterministic verification ✅ (a check, not yet a loop) · `b5fd76d`
+
+**Built:** `domain/verification.py` (`VerificationStatus` RECOVERED / UNRESOLVED / INCONCLUSIVE /
+SKIPPED, `evaluate_verification()`) and `tools/mock_verification.verify_service_health()`.
+
+**Design:** pure code, reading raw metrics and pod evidence through the same `evaluate()` policy
+escalation uses, so "recovered" means "no escalation rule trips". Missing, malformed or unreadable
+evidence is INCONCLUSIVE, never healthy (principle 18 applied again). No executed step means SKIPPED,
+never RECOVERED.
+
+**Gaps, in order of importance:**
+- **Recovery is injected, not caused.** The post-remediation world is the `post_remediation_scenario`
+  argument, and `POST /incidents` defaults it to `HEALTHY`. Because the mock executor changes
+  nothing, a RECOVERED result reflects that parameter, not the effect of any remediation. This is
+  fine for exercising routing and invariants; it proves nothing about whether a remediation works.
+- **It is not a loop.** `MAX_VERIFICATION_ATTEMPTS = 2` exists, but the workflow makes exactly one
+  attempt and never re-remediates or re-investigates. The original plan ("if not, re-investigate")
+  is not built; UNRESOLVED and INCONCLUSIVE simply escalate.
+- Verification checks only the first executed step's service.
+
+**Tests:** 20.
+
+---
+
+### Phase 14 — Operational tracing ✅ · `73f5e20` (workflow wiring `6fcf672`)
+
+**Built:** `observability/events.py` (frozen trace, stage and tool-invocation models, an error
+category enum, diagnostic reasons), `observability/redaction.py` (secret and bearer-token masking,
+safe on cyclic structures) and `observability/tracer.py` (`OperationalTracer`, stage and tool spans,
+single-line JSON logs on an isolated logger that does not touch the root logger).
+
+**Boundary:** tracing is observational only. It does not alter routing, guardrails or verification,
+and `POST /incidents` returns the sanitised trace.
+
+**Gaps:**
+- The workflow nodes wrap tracer calls in `try/except Exception: pass`, so a tracer bug is silent.
+  That protects the incident path, and it also hides defects in the tracer itself.
+- No token or cost counting, although the roadmap line mentions tokens.
+- No endpoint to retrieve a past trace; it only comes back in the response to the request that made it.
+
+**Tests:** 20 tracer, 25 events and redaction, 19 workflow-observability.
+
+---
+
+### Workflow integration — execute, verify, resolve · `6fcf672`
+
+`workflows/incident.py` grew from 295 to 784 lines. The graph is now:
+
+```
+assess_severity -> investigate -> route_by_severity -+- normal -> monitor
+                                                       `- urgent -> analyze_root_cause
+   -> plan_remediation -> apply_guardrails -> execute_remediation -> verify_remediation
+   -> remember_incident -> route_after_verification -+- RECOVERED -> resolve
+                                                     `- otherwise -> escalate
+```
+
+`handle_incident()` gained `post_remediation_scenario`, `incident_id`, `correlation_id` and `tracer`.
+Routing by severity is unchanged and still reads raw evidence. `remember_incident` now records what
+was executed, blocked or skipped plus the verification outcome in the learned entry's resolution.
+
+**Caveat on memory:** because recovery is simulated, a learned entry can say "Recovery: verified
+recovered" for a remediation that did nothing. It is still stored as `learned` and marked unverified
+at retrieval, but that text is the system recording a simulated success as a fact.
+
+---
+
+### Phase 13 — Golden-case evaluation ✅ (pipeline, not model quality) · `14a42cb`
+
+**Built:** `evaluation/` with 9 golden cases (NORM-01, DEGR-01/02, AMBI-01/02/03, UNSF-01/02/03),
+frozen case and result models, a runner, and metrics. It uses two named gates: **Gate A** is the
+urgent-or-normal routing decision and **Gate B** is the resolve / escalate / monitor outcome.
+
+**The runner executes cases through the real workflow with the LLM steps stubbed**, with no network
+and no live model. So it evaluates the deterministic pipeline: routing, guardrails, execution
+authorization, verification. It does not measure whether a model's narrative is right.
+
+**Metrics:** under-escalation rate, false-escalation rate, false-recovery rate, execution
+authorization rate, blocked-step containment rate, escalation accuracy, and four invariants
+(no unauthorized execution, no blocked or unapproved execution, no repeat remediation, no invalid
+resolution). A zero denominator returns `None` rather than a false 0% or 100%. Invariant failures
+name the case and step.
+
+**Not covered:** the recurring "model narrative misstates observed values" problem (section 6) has
+no evaluation. There is no scoring of live-model output and no stored baseline to detect regression.
+
+**Tests:** 39.
+
+---
+
+### Phase 15 — Config, API, CLI, container, CI 🚧 (partial) · `52e2a5e`, `b5078b8`
+
+**Built:**
+- `config.py`: validated `Settings` (credentials as `SecretStr`), `get_settings()`.
+- `api/app.py`: `GET /health`, `GET /ready`, `POST /incidents` (runs the workflow synchronously,
+  returns diagnostics, verification and the sanitised trace). Rate-limit and configuration errors
+  map to clean responses; other failures become a generic 500.
+- `cli.py`: `agentic-ai-demo`, which runs one incident and prints a report.
+- `Dockerfile`: multi-stage, non-root user, health check, locked `uv sync`.
+- `.github/workflows/ci.yml`: ruff lint, ruff format check, full pytest.
+- `ruff` configured in `pyproject.toml`; the lint passes.
+
+**Not done or unverified:**
+- **The Docker image has never been built or run.** Image size is unmeasured, and `sentence-transformers`
+  pulls in a large dependency tree. The memory directory inside the container is not a volume.
+- **CI will fail on the live-LLM test.** `test_assess_severity_live` has no skip guard and CI has no
+  API key. This is a defect in the committed workflow, not yet fixed. Also, `ruff format --check`
+  covers only a hand-picked list of files.
+- **There is no approval endpoint.** The only routes are the three above, so nothing can call
+  `GuardedPlan.approve()`. HIGH-risk steps can never be authorised.
+- No authentication, no rate limiting, and the workflow runs inside the request handler, so a slow
+  LLM call blocks the worker.
+- Kubernetes, AWS and Terraform, named in the roadmap for this phase, are not started.
+
+**Tests:** 13 API, 13 config, 18 CLI.
+
+---
+
+### Phase 16 — Incident persistence 🚧 (contract only) · `a0c22a2`
+
+**Built:** frozen domain records (`IncidentRecord`, stage and remediation records, a lifecycle
+status enum), an `IncidentRepository` protocol with `IncidentNotFoundError` and
+`IncidentConflictError`, a thread-safe `InMemoryIncidentRepository`, a migration runner (checksum
+verification, transactional apply, a `schema_migrations` table) and `001_initial_incident_schema.sql`.
+It is deliberately separate from the JSONL learned-memory file: this is the audit trail, that is
+retrieval material.
+
+**Not done:**
+- **Nothing uses it.** Neither the API nor the workflow writes to a repository.
+- **There is no Postgres repository implementation**, and no code imports `psycopg`.
+- **The migrations have never run against a real database.** The one live test is skipped when no
+  server is configured (the single skip in the suite).
+- `domain/persistence.py` imports `agentic_ai.api.schemas`, so the domain layer depends on the API
+  layer. That inverts the dependency rule in section 3 and should be fixed before more code builds on it.
+
+**Tests:** 17 repository and record tests, 12 migration tests (1 skipped).
+
+---
+
 ### Hardening — understanding and surfacing the OpenRouter rate limit properly ✅
 
 **Goal:** the free-tier 429 had been hit twice (Phase 5.6, Phase 7) and left as an open known issue
@@ -1412,52 +1589,69 @@ hours.
 
 ## 5. Current State
 
-**Test suite: 167 tests** (43 escalation · 39 mock tools · 18 investigation · 17 knowledge ·
-12 rca · 17 workflow · 11 incident · 6 openrouter provider · 4 severity). Exactly one touches the
-live LLM directly (`test_assess_severity_live`); the knowledge tests load a real local embedding
-model but no LLM; the OpenRouter provider tests mock the HTTP layer deliberately, to test 429 handling
-without consuming real quota; the rest are fully deterministic. 166 passed as of this writing - the
-live test fails once the daily quota is exhausted, now with a clear `LLMRateLimitError` instead of a
-generic one (see Known Issues).
+**Test suite: 461 passed, 1 skipped** (plus `test_assess_severity_live`, which needs a live LLM and
+OpenRouter quota, and is deselected in the runs reported here). The skip is the live PostgreSQL
+migration test. Everything else is deterministic: the knowledge tests load a real local embedding
+model but no LLM, the OpenRouter provider tests mock HTTP, and the evaluation harness stubs the LLM
+steps. Full run takes about 3 minutes, mostly the embedding model. `ruff check` passes.
 
 ```
 src/agentic_ai/
 ├── domain/
 │   ├── incident.py          Incident, Severity, IncidentStatus, transition_to()
-│   ├── investigation.py     Evidence, Finding (now with id), TimelineEntry,
-│   │                        InvestigationResult, TerminationReason, TimelineEventType
+│   ├── investigation.py     Evidence, Finding, TimelineEntry, InvestigationResult
 │   ├── escalation.py        Deterministic escalation policy over raw evidence
-│   ├── knowledge.py         KnowledgeEntry, KnowledgeSearchResult
-│   └── rca.py               RootCauseAnalysis, AlternativeHypothesis,
-│                            KnowledgeBaseConsistency
-├── llm/
-│   ├── client.py            LLMClient protocol, ChatResponse, ToolCall, get_client(),
-│   │                        LLMRateLimitError
-│   ├── severity.py          SeverityAssessment, assess_severity(), custom exceptions
-│   ├── rca.py                analyze_root_cause() - one call, no tools, no loop
-│   └── providers/
-│       ├── ollama_provider.py       local model, synthesises a tool_call id
-│       └── openrouter_provider.py   hosted, OpenAI-compatible, default provider
+│   ├── knowledge.py         KnowledgeEntry (source: curated | learned), search result
+│   ├── rca.py               RootCauseAnalysis, AlternativeHypothesis
+│   ├── remediation.py       Action types, risk tiers, plan, execution results
+│   ├── guardrails.py        Tier policy, GuardedPlan, approve()/reject()
+│   ├── verification.py      VerificationStatus, evaluate_verification()
+│   └── persistence.py       Incident run records (imports api.schemas: see Known Issues)
+├── llm/                     client + providers (OpenRouter default, Ollama), severity, rca,
+│                            remediation: all one-shot structured-output calls
 ├── tools/
-│   ├── mock_tools.py          get_mock_logs/metrics/pod_status(), MockService
-│   ├── registry.py            build_tool_schemas(), dispatch_tool(), REQUIRED_TOOLS
-│   ├── knowledge_corpus.py    18 synthetic past-incident records
-│   ├── knowledge_retrieval.py embed-once, in-memory cosine similarity search
-│   └── search_tool.py         search_knowledge_base(), the agent-facing tool
-├── agents/investigation.py  bounded ReAct subgraph, investigate(), coverage enforcement
-├── workflows/incident.py    assess -> investigate -> route -> [RCA] -> escalate/monitor
-└── api/                     (empty — later)
+│   ├── mock_tools.py        Mock logs / metrics / pod status, scenarios
+│   ├── registry.py          Tool schemas and dispatch (single source of truth)
+│   ├── knowledge_*.py       Corpus (18 curated), retrieval, search tool
+│   ├── incident_memory.py   JSONL learned memory
+│   ├── mock_remediation.py  execute_guarded_plan(), [SIMULATED] actions
+│   └── mock_verification.py verify_service_health()
+├── agents/investigation.py  Bounded ReAct subgraph: the only looping agent
+├── workflows/incident.py    The full incident graph (see Phase 11-16 entries)
+├── mcp_server/server.py     Read-only MCP server over the investigation tools
+├── evaluation/              9 golden cases, runner, metrics, invariants
+├── observability/           Tracer, trace models, redaction
+├── persistence/             Repository protocol, in-memory repo, migrator, SQL migration
+├── api/                     FastAPI: /health, /ready, POST /incidents
+├── config.py                Validated settings
+└── cli.py                   agentic-ai-demo
 ```
 
-**Dependencies:** `langgraph>=1.2.11` · `httpx>=0.28.1` · `python-dotenv>=1.2.4` ·
-`sentence-transformers` · `numpy` · `pydantic>=2.13.5` ·
-`ollama>=0.6.2` (kept, no longer the default) · *dev:* `pytest>=9.1.1`
+**Entry points:** `agentic-ai-demo` (CLI), `agentic-ai-mcp` (MCP server), and
+`uvicorn agentic_ai.api.app:app` (API).
 
-**LLM provider:** OpenRouter by default (`LLM_PROVIDER=openrouter` in `.env`, see `.env.example`),
-model `nvidia/nemotron-3-super-120b-a12b:free`. Ollama remains available via `LLM_PROVIDER=ollama`.
+**Dependencies:** `langgraph` · `httpx` · `python-dotenv` · `sentence-transformers` · `numpy` ·
+`pydantic` · `ollama` (kept, not default) · `mcp` · `fastapi` · `psycopg[binary]` (declared, unused) ·
+*dev:* `pytest`, `ruff`.
 
-**Branches:** everything through Phase 5.5 has been merged to `main` and pushed; Phase 5.6
-(this provider switch) is committed locally on `main`, not yet pushed.
+**LLM provider:** OpenRouter by default (`LLM_PROVIDER=openrouter`), model
+`nvidia/nemotron-3-super-120b-a12b:free`, subject to the 50 requests/day account quota. Ollama via
+`LLM_PROVIDER=ollama`.
+
+**What is real versus simulated:**
+
+| Real | Simulated or unconnected |
+|---|---|
+| LLM calls for severity, investigation, RCA, planning | Observability tools (fixed fixtures) |
+| Deterministic escalation, guardrails, verification logic | Remediation execution (returns text only) |
+| Local embedding retrieval, JSONL memory | Post-remediation health (an injected scenario) |
+| MCP server, FastAPI service | Persistence (in-memory only; no database used) |
+
+**Commit index:** Phases 1-7 and the rate-limit hardening, up to `dc31bc1` (pushed) · Phase 7b and 8 `c59edc6` · Phase 9 `3f1807c` ·
+Phase 10 `b3b2b75` · Phase 11 `0397465` · Phase 12 `b5fd76d` · Phase 14 `73f5e20` · workflow
+integration `6fcf672` · Phase 13 `14a42cb` · Phase 15 `52e2a5e`, `b5078b8` · Phase 16 `a0c22a2` ·
+README `d1b7de2`. Everything after `dc31bc1` is committed locally and not pushed (`main` is 12
+commits ahead of `origin/main`).
 
 ---
 
@@ -1469,9 +1663,22 @@ model `nvidia/nemotron-3-super-120b-a12b:free`. Ollama remains available via `LL
 | `TIMEOUT` termination reason | Reserved, unreachable | No wall-clock enforcement implemented yet |
 | `TimelineEntry.event_type` | Not built | Must be an **enum**, not free text |
 | `workflows/` vs `agents/` boundary | Provisional | Held up so far: the workflow node *calls* the agent rather than embedding it. Will be tested again in Phase 7 by the Supervisor |
-| `escalate` / `monitor` are stubs | Open | They set `next_step` but take no action. Real behaviour arrives with Phase 10 approval gates and Phase 11 remediation |
+| `escalate` / `monitor` / `resolve` take no action | Open | They record `next_step` and a trace outcome. Nothing is paged, ticketed or closed. Remediation exists (Phase 11) but is simulated |
+| No way to approve a HIGH-risk step | **Open, most important gap** | `GuardedPlan.approve()` exists and the executor honours it, but no API route, CLI command or queue calls it. HIGH steps stay PENDING, are always skipped, and verification then reports SKIPPED |
+| Verification is injected, not causal | Open | RECOVERED depends on the `post_remediation_scenario` argument (API default `HEALTHY`); the mock executor changes nothing. No retry or re-investigation loop although `MAX_VERIFICATION_ATTEMPTS = 2` exists |
+| CI fails on the live-LLM test | Open, defect | `test_assess_severity_live` has no skip guard and CI has no API key. Needs a skip condition or a marker excluded in CI |
+| `ruff format --check` covers a hand-picked file list | Open | Lint covers everything; the format check does not |
+| Docker image never built or run | Open | Image size unmeasured; `sentence-transformers` is a heavy dependency; memory directory is not a volume |
+| Postgres migrations never run against a database | Open | The one live test skips without a configured server |
+| Persistence is unconnected | Open | Repository protocol and in-memory implementation exist; no Postgres implementation, and neither API nor workflow writes to it. `psycopg` is declared and unused |
+| `domain/persistence.py` imports `api.schemas` | Open | Domain depends on the API layer, which inverts the rule in section 3 |
+| Tracer failures are swallowed | Open | Workflow nodes use `try/except Exception: pass` around tracing; a tracer bug is silent |
+| Learned memory can record simulated success as fact | Open | An entry can read "Recovery: verified recovered" for a remediation that did nothing. Still `learned` and unverified at retrieval |
+| API has no auth, rate limiting or async handling | Open | `POST /incidents` runs the whole workflow, including LLM calls, synchronously in the handler |
+| Evaluation measures the pipeline, not the model | Open | 9 golden cases with stubbed LLM steps; nothing scores live-model narrative accuracy or tracks regression |
+| Nothing after `dc31bc1` is pushed | Open | `main` is 12 commits ahead of `origin/main` |
 | `AVAILABLE_SERVICES` mutability | Minor | `list` → `tuple` would prevent accidental mutation |
-| Linter / formatter | Not set up | `ruff` or `black`; stray-whitespace artifacts already seen |
+| Linter / formatter | Resolved (partly) | `ruff` configured and lint passes; see the format-check gap above |
 | Git author identity | Unconfigured | Commits carry an auto-guessed name/email on a public repo |
 | Model-assessed confidence calibration | Unknown | Ordering looks sensible; true calibration is a Phase 13 question |
 | Prompt robustness | Improved | Verified on three scenarios including a healthy service. A fourth (partial/ambiguous evidence) remains untested |
@@ -1499,13 +1706,15 @@ model `nvidia/nemotron-3-super-120b-a12b:free`. Ollama remains available via `LL
 | 8 | Memory — long-term done (file-backed, unverified-by-default); vector store deferred | ✅ |
 | 9 | MCP & tool engineering — server done; agent-side MCP client deferred | ✅ |
 | 10 | Guardrails — risk tiers, approval gates (domain mechanism; no approval surface yet) | ✅ |
-| 11 | Remediation (mock first) | ⬜ |
-| 12 | Verification loop | ⬜ |
-| 13 | Evaluation — golden cases, regression | ⬜ |
-| 14 | Observability — tracing, spans, tokens | ⬜ |
-| 15 | Production — Docker, K8s, AWS, Terraform, CI/CD | ⬜ |
+| 11 | Remediation (mock first) — executor honours guardrails; actions are text only | ✅ |
+| 12 | Verification — single deterministic check; no retry loop; recovery injected | 🚧 |
+| 13 | Evaluation — 9 golden cases over the stubbed pipeline; no model-quality scoring | 🚧 |
+| 14 | Observability — spans, JSON logs, redaction; no token counts, no trace retrieval | 🚧 |
+| 15 | Production — API, config, CLI, Docker, CI done; Docker unbuilt, CI has a defect; K8s, AWS, Terraform not started | 🚧 |
+| 16 | Persistence — contract, in-memory repo, migrations; not wired, no Postgres implementation | 🚧 |
+| — | **Approval surface** (route or CLI to approve/reject pending steps) | ⬜ next |
 
-**Guardrail model planned for Phase 10:**
+**Guardrail model, implemented in Phase 10:**
 
 ```
 LOW      → automatic
@@ -1599,3 +1808,10 @@ Extracted from decisions actually made in this project, not aspirational:
     timestamp - a 50-requests-per-day account quota, not per-minute throttling. A backoff-and-retry
     built on the assumed version would have failed silently for hours instead of surfacing the real
     constraint.
+31. **A simulation that cannot change state cannot verify a fix.** Verification reads an injected
+    scenario, so "recovered" reports a parameter, not an outcome. Exercising the routing and the
+    invariants is a legitimate use of that; claiming the remediation works is not. Say which one a
+    test or an entry is establishing.
+32. **A log that trails the code is worse than no log.** Phases 11-16 landed while this file still
+    said Phase 10, so the roadmap actively misled. Entries are written from the code and cite the
+    commit that introduced each piece, so a reader can check them.
