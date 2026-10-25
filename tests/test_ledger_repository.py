@@ -324,6 +324,98 @@ def test_a_lock_is_held_across_threads(incident_store) -> None:
 
 
 # =============================================================================
+# Pending queue: pagination, filters, count
+# =============================================================================
+
+
+def _pending(store, *, target="payment", action="rollback_deployment", n=1, closed=False):
+    """``n`` incidents each with one pending approval for (action, target)."""
+    made = []
+    for _ in range(n):
+        record, _, (approval,) = saved_incident(store, (action, target))
+        if closed:
+            store.save_incident(
+                IncidentRecord.from_workflow_state(
+                    state_for(record.incident_id, guarded((action, target)), "resolve")
+                )
+            )
+        made.append(approval)
+    return made
+
+
+def _unique_service() -> str:
+    return f"svc-{uuid.uuid4().hex[:8]}"
+
+
+def test_pages_are_consistent_and_complete(incident_store) -> None:
+    svc = _unique_service()  # isolates this test's rows from any others in a shared database
+    made = _pending(incident_store, target=svc, n=5)
+
+    pages = [
+        incident_store.list_pending_approvals(2, offset, target_service=svc) for offset in (0, 2, 4)
+    ]
+
+    assert [len(p) for p in pages] == [2, 2, 1]
+    flat = [a.approval_id for page in pages for a in page]
+    assert len(set(flat)) == 5 and set(flat) == {a.approval_id for a in made}  # no gaps, no repeats
+    assert flat == sorted(flat, key=lambda i: next(
+        (a.requested_at, a.approval_id) for a in made if a.approval_id == i
+    ))  # fmt: skip
+    assert incident_store.list_pending_approvals(2, 10, target_service=svc) == []
+    assert incident_store.count_pending_approvals(target_service=svc) == 5
+
+
+def test_filters_narrow_the_queue_and_the_count(incident_store) -> None:
+    svc = _unique_service()
+    _pending(incident_store, target=svc, action="rollback_deployment", n=2)
+    _pending(incident_store, target=svc, action="failover", n=1)
+
+    def ids(**kw):
+        return incident_store.list_pending_approvals(50, 0, target_service=svc, **kw)
+
+    assert len(ids()) == 3
+    assert [a.action_type for a in ids(action_type="failover")] == ["failover"]
+    assert len(ids(action_type="rollback_deployment")) == 2
+    assert ids(action_type="restart_service") == []
+    assert incident_store.count_pending_approvals(target_service=svc, action_type="failover") == 1
+    assert incident_store.count_pending_approvals(target_service=_unique_service()) == 0
+
+
+def test_decided_approvals_are_not_pending(incident_store) -> None:
+    svc = _unique_service()
+    first, second = _pending(incident_store, target=svc, n=2)
+    incident_store.decide_approval(
+        first.incident_id, first.approval_id, ApprovalState.APPROVED, "a"
+    )
+
+    left = incident_store.list_pending_approvals(50, 0, target_service=svc)
+
+    assert [a.approval_id for a in left] == [second.approval_id]
+    assert incident_store.count_pending_approvals(target_service=svc) == 1
+
+
+def test_approvals_on_closed_incidents_are_left_out_unless_asked_for(incident_store) -> None:
+    svc = _unique_service()
+    _pending(incident_store, target=svc, n=2)
+    _pending(incident_store, target=svc, n=1, closed=True)
+
+    open_only = incident_store.list_pending_approvals(50, 0, target_service=svc)
+    everything = incident_store.list_pending_approvals(
+        50, 0, target_service=svc, include_closed=True
+    )
+
+    assert (len(open_only), len(everything)) == (2, 3)
+    assert incident_store.count_pending_approvals(target_service=svc) == 2
+    assert incident_store.count_pending_approvals(target_service=svc, include_closed=True) == 3
+
+
+@pytest.mark.parametrize("kwargs", [{"limit": 0}, {"limit": -1}, {"limit": 5, "offset": -1}])
+def test_bad_paging_is_refused(incident_store, kwargs) -> None:
+    with pytest.raises(ValueError):
+        incident_store.list_pending_approvals(**kwargs)
+
+
+# =============================================================================
 # PostgreSQL schema (needs a real server)
 # =============================================================================
 
@@ -483,6 +575,22 @@ def test_the_lock_dies_with_its_session(pg_clean) -> None:
         pg_clean.execute("SELECT pg_terminate_backend(%s)", (holders[0],))  # the 'crash'
         with store.resume_lock(incident_id) as taken_over:
             assert taken_over is True  # the dead session's lock is gone
+
+
+def test_pending_queue_query_can_use_the_partial_index(pg_clean) -> None:
+    pg_clean.execute("SET enable_seqscan = off")
+    plan = "\n".join(
+        row[0]
+        for row in pg_clean.execute(
+            "EXPLAIN SELECT approval_id FROM incident_approvals WHERE status = 'pending' "
+            "AND target_service = 'x' ORDER BY requested_at, approval_id LIMIT 50 OFFSET 0"
+        ).fetchall()
+    )
+    assert "idx_incident_approvals_pending" in plan
+
+
+# the datetime import is used by fixtures above in some Python versions' lint passes
+_ = (datetime, timezone)
 
 
 def test_the_latest_snapshot_is_the_last_one_stored_even_when_timestamps_tie(

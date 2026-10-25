@@ -176,3 +176,110 @@ class ApprovalListResponse(BaseModel):
     approvals: list[ApprovalResponse]
 
     model_config = ConfigDict(frozen=True)
+
+
+class ResumeRequest(BaseModel):
+    """Resume an incident's stored plan. Both fields are optional.
+
+    ``requested_by`` is a free-text label recorded in the audit trail. **It is not an
+    authenticated identity** (this service has no authentication).
+    """
+
+    post_remediation_scenario: Scenario | None = None
+    requested_by: str | None = Field(default=None, max_length=128)
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    @field_validator("requested_by")
+    @classmethod
+    def _requested_by_cleaned(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
+
+
+class ResumeStepResponse(BaseModel):
+    step_index: int
+    action_type: str
+    target_service: str
+    disposition: str
+    execution_status: str
+    """executed, skipped, blocked, failed or unknown."""
+    output: str
+    error: str | None = None
+    ran_now: bool
+    """True only if this resume executed the step; False if it only reported on it."""
+
+    model_config = ConfigDict(frozen=True)
+
+
+class ResumeResponse(BaseModel):
+    incident_id: str
+    plan_fingerprint: str
+    snapshot_id: str
+    outcome: str  # "resolve" or "escalate"
+    status: str
+    steps: list[ResumeStepResponse]
+    verification: VerificationSummary
+    persisted: bool
+    """False means the steps ran (they are in the execution ledger) but the incident record
+    could not be saved; resuming again completes the save without running anything twice."""
+    error: str | None = None
+    requested_by_verified: bool = False
+    """Always False: ``requested_by`` is caller-supplied and unauthenticated."""
+
+    model_config = ConfigDict(frozen=True)
+
+
+class PendingApprovalSummary(BaseModel):
+    """A pending approval as listed across incidents.
+
+    Deliberately minimal: no rationale, fingerprints or execution detail. Fetch the
+    incident's own approvals for more.
+    """
+
+    approval_id: str
+    incident_id: str
+    step_index: int
+    action_type: str
+    target_service: str
+    status: str
+    requested_at: datetime
+
+    model_config = ConfigDict(frozen=True)
+
+
+class PendingApprovalsResponse(BaseModel):
+    approvals: list[PendingApprovalSummary]
+    total: int
+    limit: int
+    offset: int
+    has_more: bool
+
+    model_config = ConfigDict(frozen=True)
+
+
+class StepExecutionResponse(BaseModel):
+    """One ledger entry. Output and error text are left out on purpose."""
+
+    execution_id: str
+    step_index: int
+    action_type: str
+    target_service: str
+    status: str  # started, succeeded, failed
+    source: str  # workflow, resume
+    started_at: datetime
+    finished_at: datetime | None = None
+    outcome_unknown: bool
+    """True for a step that started and never recorded a result: it may or may not have
+    taken effect, and it is never replayed automatically."""
+
+    model_config = ConfigDict(frozen=True)
+
+
+class StepExecutionListResponse(BaseModel):
+    incident_id: str
+    executions: list[StepExecutionResponse]
+
+    model_config = ConfigDict(frozen=True)

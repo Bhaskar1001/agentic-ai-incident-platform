@@ -25,6 +25,7 @@ must check before acting.
 
 from collections.abc import Collection
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -184,6 +185,21 @@ def evaluate_step(
         disposition=Disposition.ALLOWED,
         reasons=reasons or ["low risk"],
     )
+
+
+def investigated_services(investigation: Any) -> set[str]:
+    """The services whose evidence the investigation actually gathered.
+
+    One definition, used both when a plan is first guarded and when a stored plan is
+    snapshotted, so a snapshot records exactly what the guardrails saw.
+    """
+    if not investigation:
+        return set()
+    return {
+        item.tool_arguments["service"]
+        for item in investigation.evidence
+        if isinstance(item.tool_arguments, dict) and "service" in item.tool_arguments
+    }
 
 
 def guard_plan(

@@ -180,13 +180,51 @@ class InMemoryIncidentRepository:
             matching.sort(key=lambda a: (a.requested_at, a.step_index, a.approval_id))
             return matching
 
-    def list_pending_approvals(self, limit: int = 50) -> list[ApprovalRecord]:
+    def _pending_matching(
+        self, action_type: str | None, target_service: str | None, include_closed: bool
+    ) -> list[ApprovalRecord]:
+        pending = []
+        for a in self._approvals.values():
+            if not a.is_pending:
+                continue
+            if action_type is not None and a.action_type != action_type:
+                continue
+            if target_service is not None and a.target_service != target_service:
+                continue
+            if not include_closed:
+                incident = self._storage.get(a.incident_id)
+                if incident is None or incident.status.is_terminal:
+                    continue
+            pending.append(a)
+        pending.sort(key=lambda a: (a.requested_at, a.approval_id))
+        return pending
+
+    def list_pending_approvals(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        *,
+        action_type: str | None = None,
+        target_service: str | None = None,
+        include_closed: bool = False,
+    ) -> list[ApprovalRecord]:
         if limit < 1:
             raise ValueError(f"limit must be >= 1, got {limit}")
+        if offset < 0:
+            raise ValueError(f"offset must be >= 0, got {offset}")
         with self._lock:
-            pending = [a for a in self._approvals.values() if a.is_pending]
-            pending.sort(key=lambda a: (a.requested_at, a.approval_id))
-            return pending[:limit]
+            pending = self._pending_matching(action_type, target_service, include_closed)
+            return pending[offset : offset + limit]
+
+    def count_pending_approvals(
+        self,
+        *,
+        action_type: str | None = None,
+        target_service: str | None = None,
+        include_closed: bool = False,
+    ) -> int:
+        with self._lock:
+            return len(self._pending_matching(action_type, target_service, include_closed))
 
     def decide_approval(
         self,

@@ -3,9 +3,9 @@
 > Single source of truth for this project: what it is, why it exists, what has been built in each
 > phase, and the reasoning behind every significant decision.
 >
-> **Last updated:** 2026-10-25 · **Current phase:** Phases 1-17 have code and tests (630 passing
-> and 92 skipped without a database; 722 passing with one). Phase 17 (the approval API) is
-> committed locally and not pushed. The pipeline now runs end to end: assess, investigate, route on evidence, root cause
+> **Last updated:** 2026-10-26 · **Current phase:** Phases 1-18 have code and tests (766 passing
+> and 196 skipped without a database; 962 passing with one). Phases 17 (approval API) and 18
+> (resume the stored plan, execution ledger) are committed locally and not pushed. The pipeline now runs end to end: assess, investigate, route on evidence, root cause
 > analysis, remediation plan, guardrails, **simulated** execution, deterministic verification, memory,
 > then resolve or escalate. It is wrapped in a FastAPI service, a demo CLI, structured tracing, a
 > golden-case evaluation harness, a Dockerfile and CI.
@@ -1590,7 +1590,7 @@ evidence for the SQL.
 
 ---
 
-### Phase 17 — Approval API: persisted, enforced human decisions ✅
+### Phase 17 — Approval API: persisted, enforced human decisions ✅ · `c962312`
 
 **What it does.** A HIGH-risk remediation step that needs a human is now recorded as a
 `PENDING` approval, a person approves or rejects it over HTTP, and the workflow enforces that
@@ -1702,7 +1702,9 @@ below), so no external quota was spent.
 
 **Known limitations.**
 - **Approver identity is unauthenticated** (above). Decisions are not tied to a person.
-- **Applying a decision means resubmitting the incident, which re-plans.** The planner is an LLM, so a
+- **Applying a decision means resubmitting the incident, which re-plans.** *(Addressed in Phase 18,
+  which adds a resume operation. Probing it also found that resubmitting re-executed an approved
+  step every time, fixed there by the execution ledger.)* The planner is an LLM, so a
   resubmission can propose a different plan; the old approval then no longer matches and a fresh one
   is requested (visible as `stale`). That is the intended safety property, but it makes the loop
   awkward. A dedicated "execute the approved plan" operation that reuses the stored plan, rather than
@@ -1716,6 +1718,139 @@ below), so no external quota was spent.
 - Remediation is still simulated, and the post-remediation world is still an injected scenario, so an
   approved step "recovering" the service is a property of that parameter (Phase 12 gap, unchanged).
 - Retrying a failed persistence step is manual (resubmit); there is no automatic retry, by design.
+
+---
+
+### Phase 18 — Resume the stored, approved plan; a durable execution ledger ✅ · `73cb8a4` (core), then the integration commit after it
+
+**What it does.** An operator approves a specific step and then resumes the *original* plan with
+`POST /incidents/{id}/resume`, without asking the LLM to plan again. The plan is stored, immutably, when
+it is presented for approval; resume re-runs the deterministic guardrails on the stored inputs, applies
+the stored decisions, executes only eligible steps through a durable execution ledger, verifies, and
+saves. Recording an approval still never executes anything.
+
+**A Phase 17 defect, found first, and why the ledger is the centre of this phase.** Probing Phase 17
+showed that after an approval, *every resubmission executed the approved step again*
+(`[executed, executed, executed]` for three submissions): nothing durably recorded that a step had
+run. Idempotency is impossible without that, so Phase 18 adds an execution ledger that **both** the
+workflow path and the resume path must claim through. The Phase 17 tests missed it because they
+resubmitted after a *rejection*, never repeatedly after an approval.
+
+**Schema (migration `003_plan_snapshots_and_execution_ledger.sql`, requires PostgreSQL 11+).**
+- `incident_plan_snapshots`: `snapshot_seq` (identity), `snapshot_id`, `incident_id` (FK, `ON DELETE
+  RESTRICT`), `plan_fingerprint`, `snapshot_version`, `checksum`, `content` (JSONB), `created_at`;
+  `UNIQUE (incident_id, plan_fingerprint, checksum)`; a trigger refuses any `UPDATE`, so a stored plan
+  cannot be edited in place. A re-presentation with different guardrail inputs is a new row, never an
+  overwrite. "Latest" is defined by `snapshot_seq`, not by a timestamp (see the flake below).
+- `incident_step_executions`: one row per `(incident_id, plan_fingerprint, step_index)` **ever**
+  (unique), `status` `started|succeeded|failed`, `source` `workflow|resume`, a lifecycle check, and a
+  trigger refusing to change a finished row. **No foreign key to incidents, on purpose:** a workflow run
+  executes steps before its record is saved, and a record of something that really happened must
+  survive a failed save. An orphan row is harmless; a missing one could cause a duplicate action.
+
+**The snapshot (`domain/plan_snapshots.py`, pure).** The ordered steps plus the inputs the guardrails
+used: root-cause confidence, whether a knowledge-base precedent agreed, and which services were
+examined (via one shared `investigated_services`, so a snapshot records exactly what the guardrails
+saw). `plan_fingerprint` is the same hash approvals are bound to, so existing approvals keep matching.
+`checksum` covers the steps and guardrail inputs; rationale and root-cause *text* are display-only and
+excluded, as in Phase 17. Written only when a plan is waiting on a human, before the approvals that
+refer to it. **Verified on every load** (version, fingerprint, checksum); a failing snapshot is never
+returned. Honest limit: a checksum is not a signature. Someone who can write the database can alter
+content and checksum together undetected. What still holds: changing the *steps* changes the recomputed
+fingerprint, so a tampered plan cannot inherit approvals, and the incident's own stored plan must match
+it before anything runs. Defending against a database-level attacker would need a keyed signature.
+
+**The ledger (`domain/step_executions.py`, `persistence/ledgered_execution.py`).** Claim, run, complete:
+`started` is committed *before* the action, then the outcome is recorded. Every failure resolves in the
+safe direction:
+
+| Situation | Result |
+|---|---|
+| Cannot record the claim | Not executed (fails closed) |
+| Step already succeeded | Not run again; reported as executed, marked "previously executed" |
+| Step already failed | Not retried automatically; reported as failed |
+| Step started, never finished | Not replayed; reported `unknown` (new `ExecutionStatus.UNKNOWN`) |
+| The action raises | Left `started`; `unknown` |
+| Cannot record the completion | Real outcome returned; the row stays `started`, so a later attempt sees it as unknown |
+| Process dies mid-action | Row stays `started`; the next resume refuses with `unknown_outcome` |
+
+**What this does not guarantee: exactly-once execution.** It guarantees the system never *starts* a
+step it has already started. If an action ran but the process died before recording it, the real
+outcome is unknown; replaying a non-idempotent external action could do harm, so it is never replayed
+automatically, and there is **no operator override** yet to resolve an unknown outcome.
+
+**Resume (`workflows/resume.py`).** Under a non-blocking per-incident lock (a PostgreSQL *session*
+advisory lock, released automatically if the process dies): refuse a closed incident; load the stored
+snapshot for the incident's *current* plan (none, or one failing its check, is refused); re-run the
+guardrails on the stored inputs with the *current* policy code; apply the stored decisions; refuse if a
+required approval is pending or rejected, or any step has an unknown outcome; execute through the ledger
+with stop-after-first-failure, revalidating **immediately before each step** (guardrails, incident still
+open, plan unchanged); verify and route with the existing deterministic code; save. Refusals happen
+before anything runs and carry a code: `resume_in_progress`, `incident_closed`, `no_remediation_plan`,
+`no_plan_snapshot`, `snapshot_integrity`, `approval_rejected`, `approvals_pending`, `unknown_outcome`.
+An approval lookup failure of any kind fails closed. The result is terminal (`resolved`, or `escalated`
+if verification does not recover, a step failed or was blocked); a `resume_remediation` stage is added
+with the unauthenticated `requested_by` label. If the steps ran but the final save fails, the response
+says `persisted: false`; resuming again executes nothing (the ledger remembers) and completes the save.
+Approval only substitutes for the human gate: a step the guardrails block stays blocked, and a blocked
+step is reported while the others proceed (a pending or rejected one refuses the whole resume).
+
+**API.** `POST /incidents/{id}/resume` (optional body `{post_remediation_scenario, requested_by}`;
+404 / 409 with the code as a `detail` prefix / 422 / 503; a generic 500 that leaks nothing).
+`GET /approvals/pending` (`limit` 1-200 default 50, `offset`, `action_type`, `target_service`,
+`include_closed`; returns `approvals`, `total`, `limit`, `offset`, `has_more`; minimal fields, no
+rationale or fingerprints). `GET /incidents/{id}/executions` (the ledger, with `outcome_unknown`; output
+and error text omitted). `POST /incidents` now also hands the ledger to the workflow. **Behaviour change:**
+`list_pending_approvals` now excludes approvals on closed incidents by default (nobody can decide them);
+`include_closed=True` restores the old result. None of this has authentication, and the docs say so.
+
+**Verified, and how.**
+- Baseline before: 630 passed, 92 skipped (no database); 722 passed (PostgreSQL 16.2).
+- After: **766 passed, 196 skipped without a database; 962 passed, 0 skipped with one.** The skips are
+  the PostgreSQL legs of tests that run once per backend (193) plus the live-LLM test's guard (not
+  executed). `ruff check` and `ruff format --check` clean (103 files). The live-LLM test was not run and
+  no external quota was used.
+- PostgreSQL legs ran against an **embedded PostgreSQL 16.2** (`pgserver`, Windows, a throwaway
+  environment, not a project dependency): the contract for snapshots, ledger, lock and queue; both
+  immutability triggers; the unique, check and foreign-key constraints; migration 003 run twice; the
+  partial index used by `EXPLAIN`; a session advisory lock freed when its backend is killed; races of 8
+  threads claiming a step (exactly one winner) and 6 threads resuming (exactly one executes); and the
+  whole resume and API flow. The Phase 18 set passed on PostgreSQL 4 runs in a row (261 tests each) and
+  in memory 12 runs in a row.
+- Resume is checked not to call the model: `forbid_llm` makes any severity, investigation, RCA or
+  planner call fail the test, and it is armed around every resume.
+- **Mutation checks** (break a mechanism on purpose, see which tests notice): no ledger -> 29 fail; resume
+  ignoring pending/rejected approvals -> 7; snapshot verification off -> 2; no resume lock -> 1 (the
+  concurrency test; the ledger alone would still have prevented a duplicate, which is defence in depth);
+  no pre-step revalidation -> 4; replaying unknown steps -> 4; not stopping after a failure -> 3.
+- **Two flakes found and fixed.** (1) A test chose an approval by list position across two plans
+  submitted milliseconds apart; on Windows their timestamps can tie, so the order was random. The test
+  now selects by what the approval authorizes. (2) A *product* weakness: "latest snapshot" was decided by
+  timestamp, so two presentations in one clock tick could tie and resume could pick the older one,
+  which may carry looser guardrail inputs. It is now a storage sequence (`snapshot_seq`; insertion order
+  in memory), with a test that stores same-instant snapshots 12 times and fails against the old ordering.
+
+**Not verified.** The GitHub Actions run. Any PostgreSQL other than that embedded 16.2 build. A real
+`uvicorn` server (HTTP tests use `TestClient`). Any real external executor: remediation is still
+simulated, so the exactly-once limitation above is reasoned about and tested against fakes, not observed.
+
+**Known limitations.**
+- **Unauthenticated.** `approver` and `requested_by` are labels; anyone who can reach the API can claim
+  any name, call resume, or read the queue.
+- **No operator override for an unknown outcome.** The incident stays awaiting approval and every resume
+  is refused until someone resolves it outside the system.
+- **The stored guardrail inputs are what was known at presentation time.** Resume uses no new information;
+  it re-runs *current policy code* on old inputs. A newer run of the same plan with different inputs is a
+  newer snapshot and wins.
+- **All-or-nothing on approvals, partial on blocks.** One pending or rejected step refuses the whole
+  resume; a guardrail-blocked step is reported and the rest proceed.
+- A failed or unknown step ends the resume and escalates the incident (terminal); later steps are not
+  attempted. The workflow path (`POST /incidents`) keeps its old behaviour of continuing after a failure.
+- Superseded approvals still sit pending; the queue hides only approvals on *closed* incidents.
+- `POST /incidents` on an already-closed incident still re-runs the whole workflow, including the LLM
+  (its steps are not re-executed, thanks to the ledger, but the save is refused as a conflict).
+- Post-remediation verification still reads an injected scenario (Phase 12 gap, unchanged).
+- Resume takes no automatic retry on any failure, by design.
 
 ---
 
@@ -1794,8 +1929,8 @@ hours.
 
 ## 5. Current State
 
-**Test suite: 630 passed, 92 skipped without a database; 722 passed, 0 skipped with `DATABASE_URL`
-set.** The skips are the PostgreSQL legs (89 of them from the approval tests, run once per backend). `test_assess_severity_live` is deselected in these runs:
+**Test suite: 766 passed, 196 skipped without a database; 962 passed, 0 skipped with `DATABASE_URL`
+set.** The skips are the PostgreSQL legs of tests that run once per backend (193 of them). `test_assess_severity_live` is deselected in these runs:
 it now skips without an OpenRouter key, and with one it currently fails (see Known Issues).
 Everything else is deterministic: the knowledge tests load a real local embedding
 model but no LLM, the OpenRouter provider tests mock HTTP, and the evaluation harness stubs the LLM
@@ -1813,6 +1948,8 @@ src/agentic_ai/
 │   ├── guardrails.py        Tier policy, GuardedPlan, approve()/reject()
 │   ├── verification.py      VerificationStatus, evaluate_verification()
 │   ├── approvals.py         ApprovalRecord, fingerprints, decide(), apply_persisted_decisions()
+│   ├── plan_snapshots.py    Immutable stored plan + guardrail inputs, integrity checks
+│   ├── step_executions.py   Execution-ledger record: started -> succeeded | failed
 │   ├── summaries.py         DiagnosticSummary, VerificationSummary
 │   └── persistence.py       Incident run records and their mapping from workflow state
 ├── llm/                     client + providers (OpenRouter default, Ollama), severity, rca,
@@ -1826,14 +1963,17 @@ src/agentic_ai/
 │   └── mock_verification.py verify_service_health()
 ├── agents/investigation.py  Bounded ReAct subgraph: the only looping agent
 ├── workflows/incident.py    The full incident graph (see Phase 11-16 entries)
+├── workflows/resume.py      resume_incident(): run the stored, approved plan, no LLM
 ├── mcp_server/server.py     Read-only MCP server over the investigation tools
 ├── evaluation/              9 golden cases, runner, metrics, invariants
 ├── observability/           Tracer, trace models, redaction
-├── persistence/             Repository protocols (incidents + approvals), in-memory and
-│                            PostgreSQL repos, factory, run persistence, migrator, `migrate`
-│                            command, SQL migrations 001-002
+├── persistence/             Repository protocols (incidents, approvals, plan snapshots,
+│                            execution ledger, resume lock), in-memory and PostgreSQL repos,
+│                            ledgered executor, run persistence, factory, migrator, `migrate`
+│                            command, SQL migrations 001-003
 ├── api/                     FastAPI: /health, /ready, POST /incidents, GET /incidents/{id},
-│                            GET .../approvals, POST .../approvals/{id}/approve|reject
+│                            GET .../approvals, POST .../approvals/{id}/approve|reject,
+│                            POST .../resume, GET /approvals/pending, GET .../executions
 ├── config.py                Validated settings
 └── cli.py                   agentic-ai-demo
 ```
@@ -1863,8 +2003,9 @@ src/agentic_ai/
 **Commit index:** Phases 1-7 and the rate-limit hardening, up to `dc31bc1` (pushed) · Phase 7b and 8 `c59edc6` · Phase 9 `3f1807c` ·
 Phase 10 `b3b2b75` · CI fix `d39079a`, `12e67b8` · Phase 16b `eaad8fd`, `9bbb696`, `56813a4`, `7d3dcb3` · Phase 11 `0397465` · Phase 12 `b5fd76d` · Phase 14 `73f5e20` · workflow
 integration `6fcf672` · Phase 13 `14a42cb` · Phase 15 `52e2a5e`, `b5078b8` · Phase 16 `a0c22a2` ·
-README `d1b7de2` · Phase 17 approval API. Everything after `dc31bc1` is
-committed locally and not pushed.
+README `d1b7de2` · Phase 17 `c962312` · Phase 18 core `73cb8a4` · Phase 18 integration (the
+commit after it). Everything after `dc31bc1` is committed locally and not pushed (`main` is 23
+commits ahead of `origin/main`).
 
 ---
 
@@ -1879,10 +2020,16 @@ committed locally and not pushed.
 | `escalate` / `monitor` / `resolve` take no action | Open | They record `next_step` and a trace outcome. Nothing is paged, ticketed or closed. Remediation exists (Phase 11) but is simulated |
 | No way to approve a HIGH-risk step | Resolved (Phase 17) | Persisted approvals, three endpoints, enforced at the execution boundary |
 | Approver identity is not authenticated | **Open, most important gap** | `approver` is a caller-supplied label; anyone who can reach the API can claim any name. Recorded as `approver_verified: false`. Needs authentication before approvals can be treated as authorization |
-| Applying a decision requires resubmitting, which re-plans | Open | The LLM planner may propose a different plan, which makes the old approval stale. A "run the approved plan as stored" operation is the fix and is not built |
-| No notification, no HTTP route for the pending queue | Open | `list_pending_approvals` exists and is tested on both repositories, but nothing exposes it and nobody is told an approval is waiting |
+| Applying a decision requires resubmitting, which re-plans | Resolved (Phase 18) | `POST /incidents/{id}/resume` runs the stored plan with no LLM call |
+| Resubmitting re-executed an approved step every time | Resolved (Phase 18) | Found by probing; fixed by the execution ledger on the workflow path |
+| No operator override for an unknown step outcome | **Open** | A step left `started` makes every resume refuse. Nothing in the system can mark it resolved; an operator must act outside it |
+| Exactly-once execution is not guaranteed | Open, inherent | The ledger prevents *starting* a step twice; it cannot know whether an external action took effect if the process died mid-action. Unknown steps are never replayed |
+| Snapshot checksum is not a signature | Open | Someone who can write the database can change content and checksum together. Altering the steps still cannot inherit approvals |
+| Resume refuses the whole plan if any approval is pending or rejected | Open, by design | All-or-nothing on approvals; a guardrail-blocked step is reported while the rest proceed |
+| `POST /incidents` on a closed incident re-runs the whole workflow | Open | Including the LLM. Steps are not re-executed (the ledger remembers) but the save is refused as a conflict |
+| No notification that an approval is waiting | Open | `GET /approvals/pending` now exposes the queue (paginated, filterable) but nobody is told; and it is unauthenticated |
 | Superseded approvals stay pending | Open, by design | Only three statuses are allowed. They are flagged `stale` and cannot be decided; likewise a step left pending when its incident resolves |
-| Record and approvals are saved in two transactions | Open, explicit | A failure between them is reported as `persisted: false`; resubmitting repairs it (registration is idempotent) |
+| Record, plan snapshot and approvals are saved in separate transactions | Open, explicit | A failure between them is reported as `persisted: false`; resubmitting repairs it (all three are idempotent) |
 | Verification is injected, not causal | Open | RECOVERED depends on the `post_remediation_scenario` argument (API default `HEALTHY`); the mock executor changes nothing. No retry or re-investigation loop although `MAX_VERIFICATION_ATTEMPTS = 2` exists |
 | CI fails on the live-LLM test | Resolved | The test skips without a key and has a `live` marker (`12e67b8`) |
 | `ruff format --check` covers a hand-picked file list | Resolved | Now `ruff format --check .` after a mechanical reformat (`d39079a`) |
@@ -1899,7 +2046,7 @@ committed locally and not pushed.
 | Learned memory can record simulated success as fact | Open | An entry can read "Recovery: verified recovered" for a remediation that did nothing. Still `learned` and unverified at retrieval |
 | API has no auth, rate limiting or async handling | Open | `POST /incidents` runs the whole workflow, including LLM calls, synchronously in the handler |
 | Evaluation measures the pipeline, not the model | Open | 9 golden cases with stubbed LLM steps; nothing scores live-model narrative accuracy or tracks regression |
-| Nothing after `dc31bc1` is pushed | Open | `main` is ahead of `origin/main` |
+| Nothing after `dc31bc1` is pushed | Open | `main` is 23 commits ahead of `origin/main` |
 | `AVAILABLE_SERVICES` mutability | Minor | `list` → `tuple` would prevent accidental mutation |
 | Linter / formatter | Resolved (partly) | `ruff` configured and lint passes; see the format-check gap above |
 | Git author identity | Unconfigured | Commits carry an auto-guessed name/email on a public repo |
@@ -1936,7 +2083,8 @@ committed locally and not pushed.
 | 15 | Production — API, config, CLI, Docker, CI done; Docker unbuilt, CI has a defect; K8s, AWS, Terraform not started | 🚧 |
 | 16 | Persistence — PostgreSQL repository, migrations, API saves and reads runs; verified on one embedded build, not in CI yet; workflow/CLI do not write | 🚧 |
 | 17 | Approval API — persisted approvals, approve/reject/list endpoints, enforced before execution; approver unauthenticated | ✅ |
-| — | **Next:** authentication for the approver; a "run the approved plan as stored" operation (no re-planning); expose the pending queue; commit and push | ⬜ |
+| 18 | Resume the stored plan — immutable snapshot, no-LLM resume, durable execution ledger, pending-queue endpoint; unauthenticated | ✅ |
+| — | **Next:** authentication for approver and operator; an operator action to resolve an unknown step outcome; notification when an approval is waiting; commit and push | ⬜ |
 
 **Guardrail model, implemented in Phase 10:**
 
@@ -2053,3 +2201,10 @@ Extracted from decisions actually made in this project, not aspirational:
 36. **A test suite that passes first time has not yet shown it can fail.** The approval tests went
     green immediately, so the enforcement point was broken on purpose two ways to see which tests
     noticed. Disabling it failed six; loosening it failed exactly the three safety tests.
+37. **Record intent before the side effect, not after.** A step is claimed durably *before* it runs,
+    so every failure leaves a trace that says "this may have happened" instead of silence. Silence
+    is what makes a retry look safe. The honest consequence is a state, `unknown`, that is surfaced
+    and never replayed, rather than a claim of exactly-once.
+38. **"Latest" must not be decided by a clock.** Two things stored within one clock tick tie, and a
+    random tiebreak then picks the wrong one some of the time. It surfaced only because the same
+    tests were run many times in a row; one green run would have shipped it. Use a sequence.

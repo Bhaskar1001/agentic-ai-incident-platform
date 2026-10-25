@@ -20,7 +20,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from agentic_ai.domain.approvals import ApprovalRecord, pending_requests_for
-from agentic_ai.domain.guardrails import GuardedPlan, guard_plan
+from agentic_ai.domain.guardrails import ApprovalState, GuardedPlan, guard_plan
 from agentic_ai.domain.incident import Severity
 from agentic_ai.domain.investigation import (
     Evidence,
@@ -38,9 +38,11 @@ from agentic_ai.domain.remediation import (
 )
 from agentic_ai.llm.client import ChatResponse
 from agentic_ai.llm.severity import SeverityAssessment
+from agentic_ai.persistence.runs import persist_workflow_run
 from agentic_ai.tools.mock_remediation import execute_guarded_plan, execute_mock_remediation_step
 from agentic_ai.tools.mock_tools import Scenario, get_mock_metrics, get_mock_pod_status
 from agentic_ai.workflows import incident as workflow_module
+from agentic_ai.workflows.incident import handle_incident
 
 ID_PREFIX = "TEST-APR-"
 
@@ -170,6 +172,45 @@ def install_pipeline_stubs(monkeypatch) -> PipelineConfig:
 
 HEALTHY = Scenario.HEALTHY.value
 STILL_BROKEN = Scenario.CONNECTION_POOL_EXHAUSTION.value
+
+
+def submit(store, incident_id: str, *, post: str = HEALTHY, lookup=None):
+    """One ``POST /incidents``: the workflow (reading approvals, claiming steps in the
+    ledger), then persistence. Returns ``(state, RunPersistence)``."""
+    state = handle_incident(
+        "Payment service is degraded",
+        scenario=Scenario.CONNECTION_POOL_EXHAUSTION,
+        post_remediation_scenario=post,
+        incident_id=incident_id,
+        approval_repository=lookup if lookup is not None else store,
+        execution_ledger=store,
+    )
+    return state, persist_workflow_run(store, state)
+
+
+def decide(store, incident_id: str, index: int, outcome: ApprovalState, who: str = "alice"):
+    approval = store.list_approvals(incident_id)[index]
+    return store.decide_approval(incident_id, approval.approval_id, outcome, who)
+
+
+def statuses(state) -> list[ExecutionStatus]:
+    return [r.status for r in state["remediation_execution"].step_results]
+
+
+def forbid_llm(monkeypatch) -> None:
+    """Make any attempt to plan, assess or analyse fail the test.
+
+    Used around resume, which must never call the planner (or any model). Replaces the
+    stubs ``install_pipeline_stubs`` put in place, and the planner's client factory.
+    """
+
+    def _called(*args, **kwargs):
+        raise AssertionError("an LLM-backed step was called during resume")
+
+    monkeypatch.setattr(workflow_module, "assess_severity", _called)
+    monkeypatch.setattr(workflow_module, "investigate", _called)
+    monkeypatch.setattr(workflow_module, "analyze_root_cause", _called)
+    monkeypatch.setattr("agentic_ai.llm.remediation.get_client", _called)
 
 
 class CountingExecutor:

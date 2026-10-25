@@ -203,8 +203,34 @@ class ApprovalRepository(Protocol):
         """An incident's approvals, oldest request first, optionally by status."""
         ...
 
-    def list_pending_approvals(self, limit: int = 50) -> list[ApprovalRecord]:
-        """Pending approvals across all incidents, oldest request first."""
+    def list_pending_approvals(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        *,
+        action_type: str | None = None,
+        target_service: str | None = None,
+        include_closed: bool = False,
+    ) -> list[ApprovalRecord]:
+        """Pending approvals across all incidents, oldest request first, paginated.
+
+        By default approvals on a closed (terminal) incident are left out: nobody can
+        decide them, so listing them would only bury the ones that matter. Approvals for
+        a plan that was replaced while the incident is still open are *not* filtered here
+        (they are flagged ``stale`` on the per-incident listing).
+
+        Raises ``ValueError`` if ``limit < 1`` or ``offset < 0``.
+        """
+        ...
+
+    def count_pending_approvals(
+        self,
+        *,
+        action_type: str | None = None,
+        target_service: str | None = None,
+        include_closed: bool = False,
+    ) -> int:
+        """How many approvals ``list_pending_approvals`` would page through."""
         ...
 
     def decide_approval(

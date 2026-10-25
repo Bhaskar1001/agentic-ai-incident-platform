@@ -8,7 +8,11 @@ Exposes:
 - GET /incidents/{incident_id}: Returns a previously saved incident record.
 - GET /incidents/{incident_id}/approvals: Lists an incident's approvals (optionally by status).
 - POST /incidents/{incident_id}/approvals/{approval_id}/approve and /reject: Record a human
-  decision. A decision never executes anything; resubmit the incident to act on it.
+  decision. A decision never executes anything.
+- POST /incidents/{incident_id}/resume: Carry the stored, approved plan forward without
+  re-planning (no LLM). Executes only eligible steps, through the execution ledger.
+- GET /approvals/pending: Pending approvals across incidents, paginated and filterable.
+- GET /incidents/{incident_id}/executions: The incident's step execution ledger.
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -29,7 +33,14 @@ from agentic_ai.api.schemas import (
     HealthResponse,
     IncidentRequest,
     IncidentResponse,
+    PendingApprovalsResponse,
+    PendingApprovalSummary,
     ReadyResponse,
+    ResumeRequest,
+    ResumeResponse,
+    ResumeStepResponse,
+    StepExecutionListResponse,
+    StepExecutionResponse,
     VerificationSummary,
 )
 from agentic_ai.config import (
@@ -52,11 +63,13 @@ from agentic_ai.persistence.repository import (
     ApprovalConflictError,
     ApprovalNotFoundError,
     IncidentNotFoundError,
+    IncidentPersistenceError,
     IncidentStore,
 )
 from agentic_ai.persistence.runs import RunPersistence, persist_workflow_run
 from agentic_ai.tools.mock_tools import DEFAULT_SCENARIO, Scenario
 from agentic_ai.workflows.incident import handle_incident
+from agentic_ai.workflows.resume import ResumeRefusedError, resume_incident
 
 logger = logging.getLogger("agentic_ai.api")
 
@@ -247,6 +260,7 @@ def create_app(
                 incident_id=req.incident_id,
                 correlation_id=req.correlation_id,
                 approval_repository=store,
+                execution_ledger=store,
             )
         except (LLMRateLimitError, LLMConfigurationError, ConfigurationError):
             raise
@@ -478,6 +492,179 @@ def create_app(
     ) -> ApprovalResponse:
         """Reject exactly one pending remediation step; it will never execute."""
         return _decide(incident_id, approval_id, req, ApprovalState.REJECTED)
+
+    # -- resume, pending queue, ledger -----------------------------------------------
+
+    _RESUME_NOTE = (
+        " Never calls the LLM planner: it takes the plan that was stored when it was presented"
+        " for approval, re-runs the deterministic guardrails on the stored inputs, applies the"
+        " stored approval decisions, and refuses (409, nothing executed) if any required"
+        " approval is pending or rejected, the incident is closed, the stored plan is missing or"
+        " fails its integrity check, or a step has an unknown outcome from an earlier attempt."
+        " Each step is claimed in the execution ledger before it runs, so a step that already ran"
+        " is not run again. This does not guarantee exactly-once execution against an external"
+        " system. `requested_by` is a caller-supplied label and is NOT authenticated."
+    )
+
+    @app.post(
+        "/incidents/{incident_id}/resume",
+        response_model=ResumeResponse,
+        responses={
+            404: {"model": ErrorResponse, "description": "Incident not found"},
+            409: {"model": ErrorResponse, "description": "Refused; nothing was executed"},
+        },
+        summary="Resume an Incident's Stored Plan",
+        description="Resume the exact approved plan without re-planning." + _RESUME_NOTE,
+        tags=["Approvals"],
+    )
+    def resume_stored_plan(
+        incident_id: str,
+        req: ResumeRequest = Body(default_factory=ResumeRequest),
+    ) -> ResumeResponse:
+        """Resume the stored plan after its approvals have been recorded."""
+        post_scenario = req.post_remediation_scenario or Scenario.HEALTHY
+        try:
+            result = resume_incident(
+                _repository(),
+                incident_id,
+                post_remediation_scenario=post_scenario.value,
+                requested_by=req.requested_by,
+            )
+        except IncidentNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ResumeRefusedError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        except IncidentPersistenceError as exc:
+            raise _storage_unavailable(exc, "resuming an incident") from exc
+        except Exception as exc:
+            logger.error("Resume failed unexpectedly: %s", type(exc).__name__)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Resuming the incident encountered an internal error.",
+            ) from exc
+
+        return ResumeResponse(
+            incident_id=result.incident_id,
+            plan_fingerprint=result.plan_fingerprint,
+            snapshot_id=result.snapshot_id,
+            outcome=result.outcome,
+            status=result.status.value,
+            steps=[
+                ResumeStepResponse(
+                    step_index=s.step_index,
+                    action_type=s.action_type,
+                    target_service=s.target_service,
+                    disposition=s.disposition,
+                    execution_status=s.execution_status,
+                    output=s.output,
+                    error=s.error,
+                    ran_now=s.ran_now,
+                )
+                for s in result.steps
+            ],
+            verification=VerificationSummary(
+                status=result.verification.status.value,
+                attempts=result.verification.attempts,
+                reasons=list(result.verification.reasons),
+            ),
+            persisted=result.persisted,
+            error=result.error,
+        )
+
+    @app.get(
+        "/approvals/pending",
+        response_model=PendingApprovalsResponse,
+        summary="List Pending Approvals Across Incidents",
+        description=(
+            "Oldest request first. Approvals on a closed incident are left out unless"
+            " `include_closed=true`, because nobody can decide them. This service has no"
+            " authentication: anyone who can reach it can read this queue."
+        ),
+        tags=["Approvals"],
+    )
+    def list_pending_approvals(
+        limit: int = Query(default=50, ge=1, le=200, description="Page size."),
+        offset: int = Query(default=0, ge=0, description="Items to skip."),
+        action_type: str | None = Query(default=None, max_length=64),
+        target_service: str | None = Query(default=None, max_length=64),
+        include_closed: bool = Query(default=False),
+    ) -> PendingApprovalsResponse:
+        try:
+            store = _repository()
+            items = store.list_pending_approvals(
+                limit,
+                offset,
+                action_type=action_type,
+                target_service=target_service,
+                include_closed=include_closed,
+            )
+            total = store.count_pending_approvals(
+                action_type=action_type,
+                target_service=target_service,
+                include_closed=include_closed,
+            )
+        except Exception as exc:
+            raise _storage_unavailable(exc, "listing pending approvals") from exc
+        return PendingApprovalsResponse(
+            approvals=[
+                PendingApprovalSummary(
+                    approval_id=a.approval_id,
+                    incident_id=a.incident_id,
+                    step_index=a.step_index,
+                    action_type=a.action_type,
+                    target_service=a.target_service,
+                    status=a.status.value,
+                    requested_at=a.requested_at,
+                )
+                for a in items
+            ],
+            total=total,
+            limit=limit,
+            offset=offset,
+            has_more=offset + len(items) < total,
+        )
+
+    @app.get(
+        "/incidents/{incident_id}/executions",
+        response_model=StepExecutionListResponse,
+        responses={404: {"model": ErrorResponse, "description": "Incident not found"}},
+        summary="List an Incident's Step Executions",
+        description=(
+            "The execution ledger: which steps were started, how they ended, and by which"
+            " path. `outcome_unknown` marks a step that started and never recorded a result."
+        ),
+        tags=["Approvals"],
+    )
+    def list_step_executions(incident_id: str) -> StepExecutionListResponse:
+        try:
+            store = _repository()
+            if store.get_incident(incident_id) is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Incident '{incident_id}' not found.",
+                )
+            records = store.list_step_executions(incident_id)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise _storage_unavailable(exc, "listing step executions") from exc
+        return StepExecutionListResponse(
+            incident_id=incident_id,
+            executions=[
+                StepExecutionResponse(
+                    execution_id=r.execution_id,
+                    step_index=r.step_index,
+                    action_type=r.action_type,
+                    target_service=r.target_service,
+                    status=r.status.value,
+                    source=r.source.value,
+                    started_at=r.started_at,
+                    finished_at=r.finished_at,
+                    outcome_unknown=r.is_unknown,
+                )
+                for r in records
+            ],
+        )
 
     return app
 

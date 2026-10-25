@@ -123,6 +123,9 @@ ON CONFLICT (incident_id, plan_fingerprint, step_index) DO NOTHING
 _APPROVAL_ORDER = "ORDER BY requested_at, step_index, approval_id"
 _PENDING_QUEUE_ORDER = "ORDER BY requested_at, approval_id"
 
+# A closed incident has no execution left to authorize, so its approvals are not decidable.
+_TERMINAL_STATUSES = [s.value for s in IncidentLifecycleStatus if s.is_terminal]
+
 _SNAPSHOT_COLUMNS = (
     "snapshot_id, incident_id, plan_fingerprint, snapshot_version, checksum, content, created_at"
 )
@@ -143,6 +146,27 @@ INSERT INTO incident_step_executions ({_EXECUTION_COLUMNS})
 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT (incident_id, plan_fingerprint, step_index) DO NOTHING
 """
+
+
+def _pending_filter(
+    action_type: str | None, target_service: str | None, include_closed: bool
+) -> tuple[str, list[Any]]:
+    """WHERE clause for the cross-incident pending queue (keeps the partial-index predicate)."""
+    clauses = ["status = 'pending'"]
+    params: list[Any] = []
+    if action_type is not None:
+        clauses.append("action_type = %s")
+        params.append(action_type)
+    if target_service is not None:
+        clauses.append("target_service = %s")
+        params.append(target_service)
+    if not include_closed:
+        clauses.append(
+            "EXISTS (SELECT 1 FROM incidents i "
+            "WHERE i.incident_id = incident_approvals.incident_id AND i.status <> ALL(%s))"
+        )
+        params.append(_TERMINAL_STATUSES)
+    return " AND ".join(clauses), params
 
 
 def _json_value(value: Any) -> Any:
@@ -404,17 +428,43 @@ class PostgresIncidentRepository:
 
         return self._in_transaction(work)
 
-    def list_pending_approvals(self, limit: int = 50) -> list[ApprovalRecord]:
+    def list_pending_approvals(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        *,
+        action_type: str | None = None,
+        target_service: str | None = None,
+        include_closed: bool = False,
+    ) -> list[ApprovalRecord]:
         if limit < 1:
             raise ValueError(f"limit must be >= 1, got {limit}")
+        if offset < 0:
+            raise ValueError(f"offset must be >= 0, got {offset}")
+        where, params = _pending_filter(action_type, target_service, include_closed)
 
         def work(cur: Any) -> list[ApprovalRecord]:
             cur.execute(
-                f"SELECT {_APPROVAL_COLUMNS} FROM incident_approvals "
-                f"WHERE status = 'pending' {_PENDING_QUEUE_ORDER} LIMIT %s",
-                (limit,),
+                f"SELECT {_APPROVAL_COLUMNS} FROM incident_approvals WHERE {where} "
+                f"{_PENDING_QUEUE_ORDER} LIMIT %s OFFSET %s",
+                (*params, limit, offset),
             )
             return [self._row_to_approval(r) for r in cur.fetchall()]
+
+        return self._in_transaction(work)
+
+    def count_pending_approvals(
+        self,
+        *,
+        action_type: str | None = None,
+        target_service: str | None = None,
+        include_closed: bool = False,
+    ) -> int:
+        where, params = _pending_filter(action_type, target_service, include_closed)
+
+        def work(cur: Any) -> int:
+            cur.execute(f"SELECT COUNT(*) FROM incident_approvals WHERE {where}", tuple(params))
+            return int(cur.fetchone()[0])
 
         return self._in_transaction(work)
 
