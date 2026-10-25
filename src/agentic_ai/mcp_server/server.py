@@ -58,9 +58,7 @@ def build_server(scenario: Scenario | None = None) -> MCPServer:
         return dispatch_tool("get_mock_pod_status", {"service": service}, fixed)
 
     def search_knowledge_base(query: str, top_k: int = DEFAULT_TOP_K) -> str:
-        return dispatch_tool(
-            "search_knowledge_base", {"query": query, "top_k": top_k}, fixed
-        )
+        return dispatch_tool("search_knowledge_base", {"query": query, "top_k": top_k}, fixed)
 
     for fn in (get_mock_logs, get_mock_metrics, get_mock_pod_status, search_knowledge_base):
         server.add_tool(

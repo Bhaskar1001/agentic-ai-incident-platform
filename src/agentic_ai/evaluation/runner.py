@@ -245,7 +245,9 @@ def run_case(case: EvalCase) -> CaseEvaluationResult:
 
     verification = final_state.get("verification")
     verification_status = verification.status if verification else None
-    verification_ran = verification is not None and verification_status != VerificationStatus.SKIPPED
+    verification_ran = (
+        verification is not None and verification_status != VerificationStatus.SKIPPED
+    )
 
     remediation_execution = final_state.get("remediation_execution")
     executed_steps = (
@@ -260,10 +262,7 @@ def run_case(case: EvalCase) -> CaseEvaluationResult:
 
     guarded_plan = final_state.get("guarded_plan")
     step_dispositions = (
-        {
-            guarded.step.action_type.value: guarded.disposition
-            for guarded in guarded_plan.steps
-        }
+        {guarded.step.action_type.value: guarded.disposition for guarded in guarded_plan.steps}
         if guarded_plan
         else {}
     )
@@ -302,9 +301,7 @@ def run_case(case: EvalCase) -> CaseEvaluationResult:
     )
 
     # Invariant and expectation verification
-    violations: list[str] = [
-        str(v) for v in check_case_invariants(case_result)
-    ]
+    violations: list[str] = [str(v) for v in check_case_invariants(case_result)]
 
     if act_gate_a != case.expected.gate_a:
         violations.append(
@@ -331,7 +328,7 @@ def run_case(case: EvalCase) -> CaseEvaluationResult:
                     f"observed '{actual_disp}', expected '{expected_disp}'."
                 )
 
-    passed = (len(violations) == 0)
+    passed = len(violations) == 0
 
     return CaseEvaluationResult(
         case_id=case.case_id,

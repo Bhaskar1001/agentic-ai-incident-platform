@@ -46,9 +46,7 @@ def _knowledge_base_section(result: InvestigationResult) -> str:
     filters by source_tool and parses its own raw_output, rather than the
     domain model needing a dedicated field for one specific tool's results.
     """
-    kb_evidence = [
-        item for item in result.evidence if item.source_tool == "search_knowledge_base"
-    ]
+    kb_evidence = [item for item in result.evidence if item.source_tool == "search_knowledge_base"]
     if not kb_evidence:
         return "No knowledge base search was performed during the investigation."
 
@@ -68,7 +66,7 @@ def _knowledge_base_section(result: InvestigationResult) -> str:
             lines.append(
                 f"- {entry['id']} ({entry['title']}, similarity "
                 f"{entry['similarity']}){unverified}: root cause was "
-                f"\"{entry['root_cause']}\""
+                f'"{entry["root_cause"]}"'
             )
 
     return "\n".join(lines) if lines else "No knowledge base matches were found."
@@ -94,15 +92,15 @@ _RCA_INSTRUCTION = (
     "- alternative_hypotheses: other plausible explanations you considered "
     "and why the evidence ranks them below your primary conclusion. Empty "
     "list if none are plausible.\n"
-    "- knowledge_base_consistency: \"supported\" if a knowledge base result "
-    "above names the same root cause, \"contradicted\" if a result exists "
-    "but names a different root cause, \"no_relevant_precedent\" if no "
+    '- knowledge_base_consistency: "supported" if a knowledge base result '
+    'above names the same root cause, "contradicted" if a result exists '
+    'but names a different root cause, "no_relevant_precedent" if no '
     "knowledge base search was performed or nothing returned was relevant.\n"
     "- knowledge_base_note: one sentence explaining that consistency "
     "judgement. Empty string if no_relevant_precedent with nothing further "
     "to add. Results marked UNVERIFIED are earlier automated guesses, not "
-    "established precedent: they must never count as \"supported\" or "
-    "\"contradicted\" - treat them as no_relevant_precedent."
+    'established precedent: they must never count as "supported" or '
+    '"contradicted" - treat them as no_relevant_precedent.'
 )
 
 
@@ -144,6 +142,5 @@ def analyze_root_cause(
             last_error = exc
             if attempt == 1:
                 raise InvalidRootCauseAnalysisError(
-                    "LLM produced an invalid or badly-cited root cause "
-                    "analysis after retry."
+                    "LLM produced an invalid or badly-cited root cause analysis after retry."
                 ) from last_error

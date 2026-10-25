@@ -18,9 +18,7 @@ def _patch_post(monkeypatch, status_code: int, body: dict):
     def fake_post(url, *, headers, json, timeout):
         return httpx.Response(status_code, json=body, request=httpx.Request("POST", url))
 
-    monkeypatch.setattr(
-        "agentic_ai.llm.providers.openrouter_provider.httpx.post", fake_post
-    )
+    monkeypatch.setattr("agentic_ai.llm.providers.openrouter_provider.httpx.post", fake_post)
 
 
 _DAILY_QUOTA_BODY = {
@@ -95,9 +93,7 @@ def test_429_with_unparseable_body_still_raises_rate_limit_error(monkeypatch) ->
         request = httpx.Request("POST", url)
         return httpx.Response(429, content=b"not json", request=request)
 
-    monkeypatch.setattr(
-        "agentic_ai.llm.providers.openrouter_provider.httpx.post", fake_post
-    )
+    monkeypatch.setattr("agentic_ai.llm.providers.openrouter_provider.httpx.post", fake_post)
     client = OpenRouterClient(api_key="test-key")
 
     with pytest.raises(LLMRateLimitError):
@@ -115,9 +111,7 @@ def test_non_429_errors_still_raise_their_ordinary_http_error(monkeypatch) -> No
 
 
 def test_successful_response_is_unaffected_by_the_429_handling(monkeypatch) -> None:
-    body = {
-        "choices": [{"message": {"role": "assistant", "content": "all good"}}]
-    }
+    body = {"choices": [{"message": {"role": "assistant", "content": "all good"}}]}
     _patch_post(monkeypatch, 200, body)
     client = OpenRouterClient(api_key="test-key")
 

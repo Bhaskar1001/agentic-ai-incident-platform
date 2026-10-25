@@ -25,12 +25,8 @@ class Incident(BaseModel):
     title: str
     severity: Severity
 
-    created_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
-    updated_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     _status: IncidentStatus = PrivateAttr(default=IncidentStatus.DETECTED)
 
@@ -83,14 +79,11 @@ class Incident(BaseModel):
         allowed_statuses = self._LEGAL_TRANSITIONS.get(self.status)
 
         if allowed_statuses is None:
-            raise ValueError(
-                f"No transition rules defined for status: {self.status.value}"
-            )
+            raise ValueError(f"No transition rules defined for status: {self.status.value}")
 
         if new_status not in allowed_statuses:
             raise ValueError(
-                f"Illegal incident status transition: "
-                f"{self.status.value} -> {new_status.value}"
+                f"Illegal incident status transition: {self.status.value} -> {new_status.value}"
             )
 
         self._status = new_status

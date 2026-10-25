@@ -84,9 +84,7 @@ class GuardedPlan(BaseModel, frozen=True):
 
     @property
     def pending_approvals(self) -> list[int]:
-        return [
-            i for i, s in enumerate(self.steps) if s.approval == ApprovalState.PENDING
-        ]
+        return [i for i, s in enumerate(self.steps) if s.approval == ApprovalState.PENDING]
 
     def approve(self, index: int, approver: str) -> "GuardedPlan":
         return self._decide(index, approver, ApprovalState.APPROVED)
@@ -105,13 +103,10 @@ class GuardedPlan(BaseModel, frozen=True):
             raise GuardrailError("A blocked step cannot be approved or rejected.")
         if guarded.approval != ApprovalState.PENDING:
             raise GuardrailError(
-                f"Step {index} is not awaiting a decision "
-                f"(state: {guarded.approval.value})."
+                f"Step {index} is not awaiting a decision (state: {guarded.approval.value})."
             )
 
-        decided = guarded.model_copy(
-            update={"approval": outcome, "decided_by": approver.strip()}
-        )
+        decided = guarded.model_copy(update={"approval": outcome, "decided_by": approver.strip()})
         steps = list(self.steps)
         steps[index] = decided
         return self.model_copy(update={"steps": steps})

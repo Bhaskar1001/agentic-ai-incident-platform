@@ -159,7 +159,9 @@ def test_mask_secrets_bearer_token() -> None:
 
 
 def test_mask_secrets_url_basic_auth() -> None:
-    url = "Failed to connect to https://admin_user:super_secret_pass@cluster.internal:8080/v1/health"
+    url = (
+        "Failed to connect to https://admin_user:super_secret_pass@cluster.internal:8080/v1/health"
+    )
     masked = mask_secrets(url)
     assert "https://[REDACTED]:[REDACTED]@cluster.internal:8080/v1/health" in masked
     assert "super_secret_pass" not in masked
@@ -474,6 +476,7 @@ def test_model_validation_rejects_invalid_values() -> None:
 
 def test_fail_safe_exception_text_never_leaked() -> None:
     """Audit: Exception text that itself contains secrets must NEVER be leaked in fallback output."""
+
     class LeakyExceptionObject:
         def __str__(self) -> str:
             raise RuntimeError("Database connection password=leaked_secret_password failed!")
@@ -482,4 +485,3 @@ def test_fail_safe_exception_text_never_leaked() -> None:
     assert sanitized == UNSAFE_FALLBACK_PLACEHOLDER
     assert "leaked_secret_password" not in str(sanitized)
     assert "RuntimeError" not in str(sanitized)
-

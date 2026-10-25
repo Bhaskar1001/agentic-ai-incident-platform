@@ -136,7 +136,9 @@ def _compute_diagnostic(
     # 1. Did verification run post-execution and fail?
     if verification is not None:
         if verification.status == VerificationStatus.UNRESOLVED:
-            reasons_str = "; ".join(verification.reasons) if verification.reasons else "anomalies persist"
+            reasons_str = (
+                "; ".join(verification.reasons) if verification.reasons else "anomalies persist"
+            )
             return DiagnosticReason(
                 decision="escalate",
                 primary_reason=f"Post-remediation verification unresolved: {reasons_str}.",
@@ -147,7 +149,9 @@ def _compute_diagnostic(
                 },
             )
         if verification.status == VerificationStatus.INCONCLUSIVE:
-            reasons_str = "; ".join(verification.reasons) if verification.reasons else "insufficient evidence"
+            reasons_str = (
+                "; ".join(verification.reasons) if verification.reasons else "insufficient evidence"
+            )
             return DiagnosticReason(
                 decision="escalate",
                 primary_reason=f"Post-remediation verification inconclusive: {reasons_str}.",
@@ -180,7 +184,8 @@ def _compute_diagnostic(
     # 3. Guardrail plan rejected or blocked steps
     if guarded is not None and guarded.steps:
         blocked_or_pending = [
-            s for s in guarded.steps
+            s
+            for s in guarded.steps
             if s.disposition in (Disposition.BLOCKED, Disposition.REQUIRES_APPROVAL)
         ]
         if blocked_or_pending:
@@ -261,11 +266,7 @@ def investigate_node(state: IncidentWorkflowState) -> dict[str, object]:
                         if isinstance(item.tool_arguments, dict)
                         else None
                     )
-                    args = (
-                        item.tool_arguments
-                        if isinstance(item.tool_arguments, dict)
-                        else {}
-                    )
+                    args = item.tool_arguments if isinstance(item.tool_arguments, dict) else {}
                     with tracer.tool_span(
                         tool_name=item.source_tool,
                         target_service=target_svc,
@@ -380,8 +381,7 @@ def apply_guardrails_node(state: IncidentWorkflowState) -> dict[str, GuardedPlan
             {
                 item.tool_arguments["service"]
                 for item in investigation.evidence
-                if isinstance(item.tool_arguments, dict)
-                and "service" in item.tool_arguments
+                if isinstance(item.tool_arguments, dict) and "service" in item.tool_arguments
             }
             if investigation
             else set()
@@ -475,9 +475,7 @@ def verify_remediation_node(
             }
 
         executed_steps = [
-            res.step
-            for res in execution.step_results
-            if res.status == ExecutionStatus.EXECUTED
+            res.step for res in execution.step_results if res.status == ExecutionStatus.EXECUTED
         ]
 
         if not executed_steps:
@@ -485,9 +483,7 @@ def verify_remediation_node(
                 "verification": VerificationResult(
                     status=VerificationStatus.SKIPPED,
                     attempts=0,
-                    reasons=[
-                        "no remediation action was executed (all steps skipped or blocked)"
-                    ],
+                    reasons=["no remediation action was executed (all steps skipped or blocked)"],
                     evidence=[],
                 )
             }
@@ -548,8 +544,7 @@ def _remember_incident_impl(state: IncidentWorkflowState) -> dict[str, bool]:
         base_resolution = "; ".join(parts)
     elif plan and plan.steps:
         proposed = "; ".join(
-            f"{step.action_type.value} on {step.target_service}"
-            for step in plan.steps
+            f"{step.action_type.value} on {step.target_service}" for step in plan.steps
         )
         base_resolution = f"Proposed (unexecuted): {proposed}"
     else:
@@ -560,16 +555,12 @@ def _remember_incident_impl(state: IncidentWorkflowState) -> dict[str, bool]:
             recovery_desc = "Recovery: verified recovered"
         elif verification.status == VerificationStatus.UNRESOLVED:
             reasons_str = (
-                "; ".join(verification.reasons)
-                if verification.reasons
-                else "anomalies persist"
+                "; ".join(verification.reasons) if verification.reasons else "anomalies persist"
             )
             recovery_desc = f"Recovery: unresolved ({reasons_str})"
         elif verification.status == VerificationStatus.INCONCLUSIVE:
             reasons_str = (
-                "; ".join(verification.reasons)
-                if verification.reasons
-                else "inconclusive evidence"
+                "; ".join(verification.reasons) if verification.reasons else "inconclusive evidence"
             )
             recovery_desc = f"Recovery: inconclusive ({reasons_str})"
         elif verification.status == VerificationStatus.SKIPPED:
@@ -660,10 +651,7 @@ def route_after_verification(
     - UNRESOLVED, INCONCLUSIVE, or SKIPPED -> escalate
     """
     verification = state.get("verification")
-    if (
-        verification is not None
-        and verification.status == VerificationStatus.RECOVERED
-    ):
+    if verification is not None and verification.status == VerificationStatus.RECOVERED:
         return "resolve"
     return "escalate"
 
@@ -729,8 +717,12 @@ def handle_incident(
     tracer: OperationalTracer | None = None,
 ) -> IncidentWorkflowState:
     """Run one incident through the full workflow with operational tracing."""
-    effective_incident_id = incident_id or (tracer.incident_id if tracer else f"INC-{uuid4().hex[:8]}")
-    effective_correlation_id = correlation_id or (tracer.correlation_id if tracer else f"CORR-{uuid4().hex[:8]}")
+    effective_incident_id = incident_id or (
+        tracer.incident_id if tracer else f"INC-{uuid4().hex[:8]}"
+    )
+    effective_correlation_id = correlation_id or (
+        tracer.correlation_id if tracer else f"CORR-{uuid4().hex[:8]}"
+    )
     effective_tracer = tracer or OperationalTracer(
         incident_id=effective_incident_id,
         correlation_id=effective_correlation_id,

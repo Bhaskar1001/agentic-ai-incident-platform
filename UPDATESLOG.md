@@ -412,7 +412,7 @@ accuracy is an open question for Phase 13 (evaluation).
 **Termination:**
 
 ```python
-MAX_INVESTIGATION_STEPS = 5   # one step = reason → select tool → execute → observe
+MAX_INVESTIGATION_STEPS = 5  # one step = reason → select tool → execute → observe
 ```
 
 One limit, not two. `MAX_ITERATIONS` and `MAX_TOOL_CALLS` were both considered and collapsed — with

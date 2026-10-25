@@ -47,9 +47,7 @@ def test_advertised_schemas_match_the_registry() -> None:
         assert set(advertised["properties"]) == set(spec["parameters"]["properties"])
         assert set(advertised["required"]) == set(spec["parameters"]["required"])
         if "service" in advertised["properties"]:
-            assert _service_values(advertised["properties"]["service"]) == set(
-                AVAILABLE_SERVICES
-            )
+            assert _service_values(advertised["properties"]["service"]) == set(AVAILABLE_SERVICES)
 
 
 def test_every_tool_is_marked_read_only() -> None:
@@ -75,9 +73,7 @@ def test_tool_call_returns_the_same_output_as_in_process_dispatch() -> None:
 def test_client_cannot_choose_the_scenario() -> None:
     result = _with_client(
         Scenario.CONNECTION_POOL_EXHAUSTION,
-        lambda c: c.call_tool(
-            "get_mock_metrics", {"service": "payment", "scenario": "healthy"}
-        ),
+        lambda c: c.call_tool("get_mock_metrics", {"service": "payment", "scenario": "healthy"}),
     )
 
     metrics = json.loads(result.content[0].text)["metrics"]
@@ -86,17 +82,13 @@ def test_client_cannot_choose_the_scenario() -> None:
 
 def test_scenario_comes_from_the_environment(monkeypatch) -> None:
     monkeypatch.setenv(SCENARIO_ENV, "healthy")
-    result = _with_client(
-        None, lambda c: c.call_tool("get_mock_metrics", {"service": "payment"})
-    )
+    result = _with_client(None, lambda c: c.call_tool("get_mock_metrics", {"service": "payment"}))
     metrics = json.loads(result.content[0].text)["metrics"]
     assert metrics["database_connections"]["utilization_percent"] < 100
 
 
 def test_unknown_service_is_rejected_as_a_tool_error() -> None:
-    result = _with_client(
-        None, lambda c: c.call_tool("get_mock_logs", {"service": "nope"})
-    )
+    result = _with_client(None, lambda c: c.call_tool("get_mock_logs", {"service": "nope"}))
     assert result.is_error
 
 

@@ -65,4 +65,3 @@ def verify_service_health(
 __all__ = [
     "verify_service_health",
 ]
-

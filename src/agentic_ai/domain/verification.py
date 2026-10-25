@@ -48,9 +48,7 @@ class VerificationResult(BaseModel, frozen=True):
     attempts: int = Field(default=1, ge=0, le=MAX_VERIFICATION_ATTEMPTS)
     reasons: list[str] = Field(default_factory=list)
     evidence: list[Evidence] = Field(default_factory=list)
-    verified_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    verified_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
     def is_recovered(self) -> bool:
@@ -73,8 +71,7 @@ def evaluate_verification(
     """
     if not 0 <= attempts <= MAX_VERIFICATION_ATTEMPTS:
         raise ValueError(
-            f"Verification attempts ({attempts}) must be between 0 and "
-            f"{MAX_VERIFICATION_ATTEMPTS}."
+            f"Verification attempts ({attempts}) must be between 0 and {MAX_VERIFICATION_ATTEMPTS}."
         )
 
     if not evidence:
@@ -92,8 +89,7 @@ def evaluate_verification(
             status=VerificationStatus.INCONCLUSIVE,
             attempts=attempts,
             reasons=[
-                f"missing required verification tool(s): "
-                f"{', '.join(sorted(missing_required))}"
+                f"missing required verification tool(s): {', '.join(sorted(missing_required))}"
             ],
             evidence=list(evidence),
         )
@@ -134,4 +130,3 @@ __all__ = [
     "VerificationStatus",
     "evaluate_verification",
 ]
-

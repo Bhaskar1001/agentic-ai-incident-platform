@@ -17,9 +17,7 @@ def test_valid_severity_assessment():
     )
 
     assert assessment.severity == Severity.CRITICAL
-    assert assessment.reasoning == (
-        "All customers are affected by a production outage."
-    )
+    assert assessment.reasoning == ("All customers are affected by a production outage.")
 
 
 def test_invalid_severity_is_rejected():
@@ -38,9 +36,7 @@ def test_assess_severity_live():
     label made the suite fail at random, which trains you to ignore failures.
     What matters for routing is that a total outage lands in the severe band.
     """
-    assessment = assess_severity(
-        "Database is completely down and all customers are affected."
-    )
+    assessment = assess_severity("Database is completely down and all customers are affected.")
 
     assert isinstance(assessment, SeverityAssessment)
     assert assessment.severity in {Severity.HIGH, Severity.CRITICAL}

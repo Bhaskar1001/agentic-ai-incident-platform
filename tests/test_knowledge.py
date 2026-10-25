@@ -68,8 +68,7 @@ def test_similarity_must_be_within_unit_range() -> None:
 
 def test_connection_pool_query_ranks_the_matching_entry_first() -> None:
     results = search(
-        "Service returns errors under load, logs mention connection pool "
-        "exhausted",
+        "Service returns errors under load, logs mention connection pool exhausted",
         top_k=3,
     )
 
@@ -106,8 +105,7 @@ def test_crash_loop_pair_is_discriminated_by_cause_not_just_crash_loop() -> None
     on which specific cause each query describes, not just "pods crashing".
     """
     config_query = search(
-        "Pods crash looping right after deploy, logs show a missing "
-        "required environment variable",
+        "Pods crash looping right after deploy, logs show a missing required environment variable",
         top_k=1,
     )
     memory_query = search(

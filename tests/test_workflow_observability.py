@@ -700,4 +700,3 @@ def test_finalization_idempotency_and_timestamp_ordering() -> None:
     for stage in snap2.stages:
         assert stage.start_time <= stage.end_time
         assert stage.duration_ms >= 0.0
-

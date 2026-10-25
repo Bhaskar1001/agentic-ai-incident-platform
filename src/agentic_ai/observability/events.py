@@ -100,9 +100,7 @@ class IncidentTrace(BaseModel, frozen=True):
 
     incident_id: str
     correlation_id: str
-    start_time: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    start_time: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     end_time: datetime | None = None
     total_duration_ms: float | None = None
     final_outcome: Literal["resolve", "escalate", "monitor"] | None = None
@@ -119,4 +117,3 @@ __all__ = [
     "StageTrace",
     "ToolInvocationTrace",
 ]
-

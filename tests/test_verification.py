@@ -296,4 +296,3 @@ def test_verify_service_health_unknown_service_is_inconclusive() -> None:
 def test_verify_service_health_bounds_attempts() -> None:
     with pytest.raises(ValueError, match="cannot exceed"):
         verify_service_health("payment", attempts=3)
-

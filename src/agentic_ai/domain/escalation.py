@@ -67,14 +67,8 @@ def _check_metrics(payload: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
 
     error_rate = metrics.get("error_rate_percent")
-    if (
-        isinstance(error_rate, (int, float))
-        and error_rate > ERROR_RATE_ESCALATION_PERCENT
-    ):
-        reasons.append(
-            f"error rate {error_rate}% exceeds "
-            f"{ERROR_RATE_ESCALATION_PERCENT}%"
-        )
+    if isinstance(error_rate, (int, float)) and error_rate > ERROR_RATE_ESCALATION_PERCENT:
+        reasons.append(f"error rate {error_rate}% exceeds {ERROR_RATE_ESCALATION_PERCENT}%")
 
     connections = metrics.get("database_connections")
     if isinstance(connections, dict):
@@ -92,9 +86,7 @@ def _check_metrics(payload: dict[str, Any]) -> list[str]:
     if isinstance(latency, dict):
         p95 = latency.get("p95")
         if isinstance(p95, (int, float)) and p95 > LATENCY_P95_ESCALATION_MS:
-            reasons.append(
-                f"p95 latency {p95}ms exceeds {LATENCY_P95_ESCALATION_MS}ms"
-            )
+            reasons.append(f"p95 latency {p95}ms exceeds {LATENCY_P95_ESCALATION_MS}ms")
 
     dependencies = metrics.get("upstream_dependencies")
     if isinstance(dependencies, dict):
@@ -150,9 +142,7 @@ def evaluate(evidence: list[Evidence]) -> EscalationDecision:
         reasons.extend(_check_pods(payload))
 
     if unreadable:
-        reasons.append(
-            "could not read output from: " + ", ".join(sorted(set(unreadable)))
-        )
+        reasons.append("could not read output from: " + ", ".join(sorted(set(unreadable))))
 
     # The agent sometimes calls the same tool twice despite being asked not
     # to, which would otherwise report an identical observation more than

@@ -84,9 +84,7 @@ def test_p95_latency_rule_is_strictly_greater_than(p95, escalates) -> None:
     ("dependency_error_rate", "escalates"),
     [(9.99, False), (10.0, False), (10.01, True), (97.0, True)],
 )
-def test_upstream_error_rule_is_strictly_greater_than(
-    dependency_error_rate, escalates
-) -> None:
+def test_upstream_error_rule_is_strictly_greater_than(dependency_error_rate, escalates) -> None:
     assert UPSTREAM_ERROR_RATE_ESCALATION_PERCENT == 10.0
     evidence = _metrics(
         upstream_dependencies={
@@ -105,9 +103,7 @@ def test_upstream_error_rule_is_strictly_greater_than(
 
 def test_open_circuit_breaker_escalates_regardless_of_error_rate() -> None:
     evidence = _metrics(
-        upstream_dependencies={
-            "ledger-api": {"error_rate_percent": 0.0, "circuit_breaker": "open"}
-        }
+        upstream_dependencies={"ledger-api": {"error_rate_percent": 0.0, "circuit_breaker": "open"}}
     )
 
     decision = evaluate(evidence)
@@ -167,9 +163,7 @@ def test_unreadable_output_escalates(raw) -> None:
 
 def test_error_shaped_tool_output_escalates() -> None:
     """A tool that ran but reported failure is missing evidence, not good news."""
-    decision = evaluate(
-        _evidence({"status": "error", "error_type": "service_not_found"})
-    )
+    decision = evaluate(_evidence({"status": "error", "error_type": "service_not_found"}))
 
     assert decision.escalate
 

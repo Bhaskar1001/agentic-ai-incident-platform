@@ -50,9 +50,7 @@ def _all_entries() -> list[KnowledgeEntry]:
 
 def _embeddings_for(entries: list[KnowledgeEntry]) -> np.ndarray:
     """Embed each entry once, keyed by id plus text so an edit re-embeds."""
-    missing = [
-        e for e in entries if _cache_key(e) not in _embedding_cache
-    ]
+    missing = [e for e in entries if _cache_key(e) not in _embedding_cache]
     if missing:
         vectors = _get_model().encode(
             [e.as_search_text() for e in missing], normalize_embeddings=True

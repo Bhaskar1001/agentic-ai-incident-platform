@@ -57,9 +57,7 @@ def _compliant_model(extra_calls=(), final_content="Investigation complete."):
     ``extra_calls`` are issued first - used to inject failing or unusual calls
     before the well-behaved ones.
     """
-    planned = list(extra_calls) + [
-        _tool_call(name, service="payment") for name in ALL_TOOL_NAMES
-    ]
+    planned = list(extra_calls) + [_tool_call(name, service="payment") for name in ALL_TOOL_NAMES]
     index = {"i": 0}
 
     def respond(**kwargs):
@@ -114,9 +112,7 @@ def test_knowledge_base_tool_schema_takes_a_query_not_a_service() -> None:
     """The retrieval tool has nothing to do with the mock service enum."""
     schemas = build_tool_schemas()
 
-    kb_schema = next(
-        s for s in schemas if s["function"]["name"] == "search_knowledge_base"
-    )
+    kb_schema = next(s for s in schemas if s["function"]["name"] == "search_knowledge_base")
     properties = kb_schema["function"]["parameters"]["properties"]
 
     assert "query" in properties
@@ -151,8 +147,7 @@ def test_premature_conclusion_is_rejected_until_coverage_is_met(monkeypatch) -> 
     """The model may not decide one source is enough - code decides that."""
     requested: list[str] = []
     # The model tries to stop after every single call; code must push back.
-    sequence = ["get_mock_logs", None, "get_mock_metrics", None,
-                "get_mock_pod_status", None]
+    sequence = ["get_mock_logs", None, "get_mock_metrics", None, "get_mock_pod_status", None]
     calls = {"i": 0}
 
     def respond(**kwargs):
@@ -187,9 +182,7 @@ def test_coverage_enforcement_cannot_loop_past_the_step_budget(monkeypatch) -> N
         # Always the same tool, then always claims to be done.
         if messages[-1]["role"] == "tool":
             return ChatResponse(content="Done.")
-        return ChatResponse(
-            content="", tool_calls=[_tool_call("get_mock_logs", service="payment")]
-        )
+        return ChatResponse(content="", tool_calls=[_tool_call("get_mock_logs", service="payment")])
 
     _patch_client(monkeypatch, respond)
 
@@ -203,9 +196,7 @@ def test_step_budget_is_enforced_against_a_looping_model(monkeypatch) -> None:
     """A model that never stops must still be stopped by deterministic code."""
 
     def respond(**kwargs):
-        return ChatResponse(
-            content="", tool_calls=[_tool_call("get_mock_logs", service="payment")]
-        )
+        return ChatResponse(content="", tool_calls=[_tool_call("get_mock_logs", service="payment")])
 
     _patch_client(monkeypatch, respond)
 
@@ -214,8 +205,7 @@ def test_step_budget_is_enforced_against_a_looping_model(monkeypatch) -> None:
     assert state["termination_reason"] is TerminationReason.MAX_STEPS_REACHED
     assert state["steps_taken"] == MAX_INVESTIGATION_STEPS
     assert any(
-        entry.event_type is TimelineEventType.STEP_LIMIT_REACHED
-        for entry in state["timeline"]
+        entry.event_type is TimelineEventType.STEP_LIMIT_REACHED for entry in state["timeline"]
     )
 
 
@@ -230,10 +220,7 @@ def test_unknown_tool_is_recoverable_not_fatal(monkeypatch) -> None:
 
     # The bad call did not stop the investigation from completing.
     assert state["termination_reason"] is TerminationReason.COMPLETED
-    assert any(
-        entry.event_type is TimelineEventType.TOOL_FAILED
-        for entry in state["timeline"]
-    )
+    assert any(entry.event_type is TimelineEventType.TOOL_FAILED for entry in state["timeline"])
     # A failed call yields no evidence, only the three real ones do.
     assert {e.source_tool for e in state["evidence"]} == set(ALL_TOOL_NAMES)
 
@@ -250,9 +237,7 @@ def test_failed_tool_result_is_still_shown_to_the_model(monkeypatch) -> None:
 
     state = build_investigation_graph().invoke(_initial_state())
 
-    payload = json.loads(
-        [m for m in state["messages"] if m["role"] == "tool"][0]["content"]
-    )
+    payload = json.loads([m for m in state["messages"] if m["role"] == "tool"][0]["content"])
     assert payload["error_type"] == "service_not_found"
     assert payload["available_services"] == ["payment"]
 
@@ -263,12 +248,8 @@ def test_evidence_preserves_raw_tool_output_verbatim(monkeypatch) -> None:
 
     state = build_investigation_graph().invoke(_initial_state())
 
-    metrics = next(
-        e for e in state["evidence"] if e.source_tool == "get_mock_metrics"
-    )
-    assert metrics.raw_output == dispatch_tool(
-        "get_mock_metrics", {"service": "payment"}
-    )
+    metrics = next(e for e in state["evidence"] if e.source_tool == "get_mock_metrics")
+    assert metrics.raw_output == dispatch_tool("get_mock_metrics", {"service": "payment"})
 
 
 # --- conclusion / summarisation -----------------------------------------
@@ -332,9 +313,7 @@ def test_summary_schema_excludes_code_owned_fields() -> None:
 
     # ...but stripped before being handed to the model.
     stripped = {
-        key
-        for key in ("evidence", "timeline", "termination_reason")
-        if key in schema["properties"]
+        key for key in ("evidence", "timeline", "termination_reason") if key in schema["properties"]
     }
     assert stripped, "sanity: these fields exist on the model"
 

@@ -147,9 +147,7 @@ def test_knowledge_base_section_ignores_evidence_from_other_tools() -> None:
         ]
     )
 
-    assert "No knowledge base search was performed" in _knowledge_base_section(
-        investigation
-    )
+    assert "No knowledge base search was performed" in _knowledge_base_section(investigation)
 
 
 # --- analyze_root_cause ---------------------------------------------------

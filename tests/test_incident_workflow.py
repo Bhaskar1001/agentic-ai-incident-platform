@@ -106,9 +106,7 @@ def stub_dependencies(monkeypatch):
                 raise rca_error
             return rca_result if rca_result is not None else _analysis()
 
-        monkeypatch.setattr(
-            workflow_module, "analyze_root_cause", fake_analyze_root_cause
-        )
+        monkeypatch.setattr(workflow_module, "analyze_root_cause", fake_analyze_root_cause)
 
         def fake_plan_remediation(description, analysis):
             if plan_error is not None:
@@ -459,9 +457,7 @@ def test_nothing_is_remembered_without_an_rca_or_on_the_monitor_path(
     assert load_memory() == []
 
 
-def test_memory_write_failure_does_not_block_escalation(
-    stub_dependencies, monkeypatch
-) -> None:
+def test_memory_write_failure_does_not_block_escalation(stub_dependencies, monkeypatch) -> None:
     def broken_remember(entry):
         raise OSError("disk full")
 
@@ -522,9 +518,7 @@ def test_allowed_step_executes_in_workflow(stub_dependencies) -> None:
     assert "Recovery: unresolved" in entry.resolution
 
 
-def test_approval_pending_step_is_not_executed_in_workflow(
-    stub_dependencies, monkeypatch
-) -> None:
+def test_approval_pending_step_is_not_executed_in_workflow(stub_dependencies, monkeypatch) -> None:
     from agentic_ai.domain.remediation import ExecutionStatus
     from agentic_ai.tools.incident_memory import load_memory
 
@@ -556,9 +550,7 @@ def test_approval_pending_step_is_not_executed_in_workflow(
     assert "Recovery: skipped" in entry.resolution
 
 
-def test_approval_rejected_step_is_not_executed_in_workflow(
-    stub_dependencies, monkeypatch
-) -> None:
+def test_approval_rejected_step_is_not_executed_in_workflow(stub_dependencies, monkeypatch) -> None:
     from agentic_ai.domain.guardrails import guard_plan
     from agentic_ai.domain.remediation import ExecutionStatus
     from agentic_ai.tools.incident_memory import load_memory
@@ -710,8 +702,7 @@ def test_accurate_incident_memory_summaries_with_multiple_steps(
 
     (entry,) = load_memory()
     assert (
-        "Executed: scale_up on payment; Skipped: rollback_deployment on payment"
-        in entry.resolution
+        "Executed: scale_up on payment; Skipped: rollback_deployment on payment" in entry.resolution
     )
     assert "Recovery: unresolved" in entry.resolution
 
@@ -767,9 +758,7 @@ def test_failed_recovery_routes_to_escalate(stub_dependencies) -> None:
     assert "Recovery: unresolved" in entry.resolution
 
 
-def test_inconclusive_verification_routes_to_escalate(
-    stub_dependencies, monkeypatch
-) -> None:
+def test_inconclusive_verification_routes_to_escalate(stub_dependencies, monkeypatch) -> None:
     from agentic_ai.domain.verification import (
         VerificationResult,
         VerificationStatus,

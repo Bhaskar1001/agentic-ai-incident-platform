@@ -294,20 +294,28 @@ def _make_result(
 def test_under_escalation_rate_synthetic() -> None:
     # 2 cases expected to be urgent: 1 routed urgent, 1 incorrectly routed normal
     results = [
-        _make_result("C1", expected_gate_a=GateADecision.URGENT, actual_gate_a=GateADecision.URGENT),
-        _make_result("C2", expected_gate_a=GateADecision.URGENT, actual_gate_a=GateADecision.NORMAL),
+        _make_result(
+            "C1", expected_gate_a=GateADecision.URGENT, actual_gate_a=GateADecision.URGENT
+        ),
+        _make_result(
+            "C2", expected_gate_a=GateADecision.URGENT, actual_gate_a=GateADecision.NORMAL
+        ),
     ]
     assert calculate_under_escalation_rate(results) == 0.5
 
     # All correctly routed urgent -> 0.0
     perfect = [
-        _make_result("C1", expected_gate_a=GateADecision.URGENT, actual_gate_a=GateADecision.URGENT),
+        _make_result(
+            "C1", expected_gate_a=GateADecision.URGENT, actual_gate_a=GateADecision.URGENT
+        ),
     ]
     assert calculate_under_escalation_rate(perfect) == 0.0
 
     # No urgent expected cases -> None
     no_urgent = [
-        _make_result("C1", expected_gate_a=GateADecision.NORMAL, actual_gate_a=GateADecision.NORMAL),
+        _make_result(
+            "C1", expected_gate_a=GateADecision.NORMAL, actual_gate_a=GateADecision.NORMAL
+        ),
     ]
     assert calculate_under_escalation_rate(no_urgent) is None
 
@@ -315,20 +323,28 @@ def test_under_escalation_rate_synthetic() -> None:
 def test_false_escalation_rate_synthetic() -> None:
     # 2 cases expected normal: 1 normal, 1 incorrectly urgent
     results = [
-        _make_result("C1", expected_gate_a=GateADecision.NORMAL, actual_gate_a=GateADecision.NORMAL),
-        _make_result("C2", expected_gate_a=GateADecision.NORMAL, actual_gate_a=GateADecision.URGENT),
+        _make_result(
+            "C1", expected_gate_a=GateADecision.NORMAL, actual_gate_a=GateADecision.NORMAL
+        ),
+        _make_result(
+            "C2", expected_gate_a=GateADecision.NORMAL, actual_gate_a=GateADecision.URGENT
+        ),
     ]
     assert calculate_false_escalation_rate(results) == 0.5
 
     # All normal -> 0.0
     perfect = [
-        _make_result("C1", expected_gate_a=GateADecision.NORMAL, actual_gate_a=GateADecision.NORMAL),
+        _make_result(
+            "C1", expected_gate_a=GateADecision.NORMAL, actual_gate_a=GateADecision.NORMAL
+        ),
     ]
     assert calculate_false_escalation_rate(perfect) == 0.0
 
     # No normal cases -> None
     no_normal = [
-        _make_result("C1", expected_gate_a=GateADecision.URGENT, actual_gate_a=GateADecision.URGENT),
+        _make_result(
+            "C1", expected_gate_a=GateADecision.URGENT, actual_gate_a=GateADecision.URGENT
+        ),
     ]
     assert calculate_false_escalation_rate(no_normal) is None
 
@@ -454,9 +470,15 @@ def test_blocked_step_containment_rate_synthetic() -> None:
 
 def test_escalation_decision_accuracy_synthetic() -> None:
     results = [
-        _make_result("C1", expected_gate_a=GateADecision.URGENT, actual_gate_a=GateADecision.URGENT),
-        _make_result("C2", expected_gate_a=GateADecision.NORMAL, actual_gate_a=GateADecision.NORMAL),
-        _make_result("C3", expected_gate_a=GateADecision.URGENT, actual_gate_a=GateADecision.NORMAL),
+        _make_result(
+            "C1", expected_gate_a=GateADecision.URGENT, actual_gate_a=GateADecision.URGENT
+        ),
+        _make_result(
+            "C2", expected_gate_a=GateADecision.NORMAL, actual_gate_a=GateADecision.NORMAL
+        ),
+        _make_result(
+            "C3", expected_gate_a=GateADecision.URGENT, actual_gate_a=GateADecision.NORMAL
+        ),
     ]
     # 2 matches out of 3 -> 0.6667
     assert calculate_escalation_decision_accuracy(results) == 0.6667
@@ -467,9 +489,15 @@ def test_escalation_decision_accuracy_synthetic() -> None:
 
 def test_missing_gate_a_decisions_are_treated_as_incorrect() -> None:
     results = [
-        _make_result("C1", expected_gate_a=GateADecision.URGENT, actual_gate_a=GateADecision.URGENT),
-        _make_result("C2", expected_gate_a=GateADecision.NORMAL, actual_gate_a=GateADecision.NORMAL),
-        _make_result("C3", expected_gate_a=GateADecision.URGENT, actual_gate_a=None),  # Missing decision!
+        _make_result(
+            "C1", expected_gate_a=GateADecision.URGENT, actual_gate_a=GateADecision.URGENT
+        ),
+        _make_result(
+            "C2", expected_gate_a=GateADecision.NORMAL, actual_gate_a=GateADecision.NORMAL
+        ),
+        _make_result(
+            "C3", expected_gate_a=GateADecision.URGENT, actual_gate_a=None
+        ),  # Missing decision!
     ]
     # 2 correct out of 3 total cases -> 2/3 = 0.6667 (not 2/2 = 1.0)
     assert calculate_escalation_decision_accuracy(results) == 0.6667
@@ -915,8 +943,7 @@ def test_report_fails_on_blocked_or_unapproved_execution_even_if_metrics_perfect
 
     # But zero-tolerance invariant caught the blocked execution:
     assert any(
-        v.invariant_name == INVARIANT_BLOCKED_OR_UNAPPROVED_EXECUTION
-        for v in all_violations
+        v.invariant_name == INVARIANT_BLOCKED_OR_UNAPPROVED_EXECUTION for v in all_violations
     )
     assert metrics.unauthorized_execution_count == 1
     assert metrics.all_invariants_passed is False
@@ -937,9 +964,3 @@ def test_report_fails_on_blocked_or_unapproved_execution_even_if_metrics_perfect
     )
 
     assert report.passed is False
-
-
-
-
-
-

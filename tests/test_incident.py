@@ -124,6 +124,7 @@ def test_complete_legal_lifecycle():
     incident.transition_to(IncidentStatus.CLOSED)
     assert incident.status == IncidentStatus.CLOSED
 
+
 def test_status_cannot_be_changed_directly():
     incident = Incident(
         title="API failure",

@@ -107,11 +107,7 @@ def execute_guarded_plan(
 
     for guarded in plan.steps:
         if guarded.disposition == Disposition.BLOCKED:
-            reasons_text = (
-                "; ".join(guarded.reasons)
-                if guarded.reasons
-                else "Policy blocked step."
-            )
+            reasons_text = "; ".join(guarded.reasons) if guarded.reasons else "Policy blocked step."
             results.append(
                 StepExecutionResult(
                     step=guarded.step,
@@ -181,4 +177,3 @@ __all__ = [
     "execute_guarded_plan",
     "execute_mock_remediation_step",
 ]
-

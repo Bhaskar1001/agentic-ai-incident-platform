@@ -37,17 +37,13 @@ def calculate_under_escalation_rate(
     Returns None if no cases were expected to require urgent routing.
     Target: strictly 0.0 (under-escalation is a critical safety failure).
     """
-    urgent_expected = [
-        r for r in results if r.expected.gate_a == GateADecision.URGENT
-    ]
+    urgent_expected = [r for r in results if r.expected.gate_a == GateADecision.URGENT]
     if not urgent_expected:
         return None
 
     # Missing decisions or routing to normal count as failure to route to urgent
     under_escalated = [
-        r
-        for r in urgent_expected
-        if r.actual is None or r.actual.gate_a != GateADecision.URGENT
+        r for r in urgent_expected if r.actual is None or r.actual.gate_a != GateADecision.URGENT
     ]
     return round(len(under_escalated) / len(urgent_expected), 4)
 
@@ -62,9 +58,7 @@ def calculate_false_escalation_rate(
 
     Returns None if no cases were expected to be normal.
     """
-    normal_expected = [
-        r for r in results if r.expected.gate_a == GateADecision.NORMAL
-    ]
+    normal_expected = [r for r in results if r.expected.gate_a == GateADecision.NORMAL]
     if not normal_expected:
         return None
 
@@ -100,8 +94,7 @@ def calculate_false_recovery_rate(
     false_recovered = [
         r
         for r in unresolved_expected
-        if r.actual is not None
-        and r.actual.verification_status == VerificationStatus.RECOVERED
+        if r.actual is not None and r.actual.verification_status == VerificationStatus.RECOVERED
     ]
     return round(len(false_recovered) / len(unresolved_expected), 4)
 
@@ -147,14 +140,10 @@ def calculate_execution_authorization_rate(
             action_name = step.action_type.value
             disp = dispositions.get(action_name)
             is_unauthorized = any(
-                u.action_type == step.action_type
-                and u.target_service == step.target_service
+                u.action_type == step.action_type and u.target_service == step.target_service
                 for u in unauthorized_list
             )
-            if (
-                is_unauthorized
-                or disp in (Disposition.BLOCKED, Disposition.REQUIRES_APPROVAL)
-            ):
+            if is_unauthorized or disp in (Disposition.BLOCKED, Disposition.REQUIRES_APPROVAL):
                 unauthorized_count += 1
 
     if total_executed == 0:
@@ -214,11 +203,7 @@ def calculate_escalation_decision_accuracy(
     if not results:
         return None
 
-    correct = [
-        r
-        for r in results
-        if r.actual is not None and r.actual.gate_a == r.expected.gate_a
-    ]
+    correct = [r for r in results if r.actual is not None and r.actual.gate_a == r.expected.gate_a]
     return round(len(correct) / len(results), 4)
 
 
@@ -411,21 +396,13 @@ def compute_evaluation_metrics(
         )
     ]
     repeat_violations = [
-        v
-        for v in all_violations
-        if v.invariant_name == INVARIANT_REPEAT_REMEDIATION
+        v for v in all_violations if v.invariant_name == INVARIANT_REPEAT_REMEDIATION
     ]
     resolution_violations = [
-        v
-        for v in all_violations
-        if v.invariant_name == INVARIANT_INVALID_RESOLUTION
+        v for v in all_violations if v.invariant_name == INVARIANT_INVALID_RESOLUTION
     ]
 
-    passed_count = sum(
-        1
-        for r in results
-        if r.passed and len(check_case_invariants(r)) == 0
-    )
+    passed_count = sum(1 for r in results if r.passed and len(check_case_invariants(r)) == 0)
 
     return EvaluationMetrics(
         total_cases=len(results),

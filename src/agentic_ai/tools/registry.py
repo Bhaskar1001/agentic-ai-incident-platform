@@ -139,9 +139,7 @@ def dispatch_tool(
 
     # Ignore any 'scenario' the model may have invented; it is not ours to
     # take from the model's arguments.
-    safe_arguments = {
-        key: value for key, value in arguments.items() if key != "scenario"
-    }
+    safe_arguments = {key: value for key, value in arguments.items() if key != "scenario"}
 
     if name in _SCENARIO_AWARE_TOOLS:
         safe_arguments["scenario"] = scenario

@@ -82,9 +82,7 @@ def test_pool_exhaustion_logs_show_connection_failures() -> None:
 
 
 def test_pool_exhaustion_metrics_show_saturated_pool() -> None:
-    connections = json.loads(get_mock_metrics("payment", POOL))["metrics"][
-        "database_connections"
-    ]
+    connections = json.loads(get_mock_metrics("payment", POOL))["metrics"]["database_connections"]
 
     assert connections["active"] == connections["pool_size"]
     assert connections["utilization_percent"] == 100

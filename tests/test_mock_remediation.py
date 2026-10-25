@@ -54,9 +54,7 @@ def _step(
     service: str = "payment",
 ) -> RemediationStep:
     action_type = (
-        action
-        if isinstance(action, RemediationActionType)
-        else RemediationActionType(action)
+        action if isinstance(action, RemediationActionType) else RemediationActionType(action)
     )
     return RemediationStep(
         action_type=action_type,
@@ -209,9 +207,7 @@ def test_prohibited_steps_never_reach_mock_handler_in_mixed_plan() -> None:
     guarded_blocked = evaluate_step(step_blocked, _analysis(0.1), SERVICES)
     guarded_to_reject = evaluate_step(step_rejected, _analysis(1.0), SERVICES)
 
-    plan = GuardedPlan(
-        steps=[guarded_allowed, guarded_pending, guarded_blocked, guarded_to_reject]
-    )
+    plan = GuardedPlan(steps=[guarded_allowed, guarded_pending, guarded_blocked, guarded_to_reject])
     plan_with_rejection = plan.reject(3, "security_team")
 
     mock_handler = Mock(wraps=execute_mock_remediation_step)
@@ -247,4 +243,3 @@ def test_requires_approval_step_not_executed_if_approval_inconsistent() -> None:
 
     assert execution.step_results[0].status == ExecutionStatus.SKIPPED
     spy_executor.assert_not_called()
-

@@ -19,12 +19,8 @@ from agentic_ai.domain.remediation import (
 )
 
 
-def _step(
-    action: str = "scale_up", service: str = "payment"
-) -> RemediationStep:
-    return RemediationStep(
-        action_type=action, target_service=service, rationale="test"
-    )
+def _step(action: str = "scale_up", service: str = "payment") -> RemediationStep:
+    return RemediationStep(action_type=action, target_service=service, rationale="test")
 
 
 def _result(
@@ -32,9 +28,7 @@ def _result(
     output: str = "Scaled up.",
     error: str | None = None,
 ) -> StepExecutionResult:
-    return StepExecutionResult(
-        step=_step(), status=status, output=output, error=error
-    )
+    return StepExecutionResult(step=_step(), status=status, output=output, error=error)
 
 
 # --- ExecutionStatus -------------------------------------------------------
@@ -127,9 +121,7 @@ def test_remediation_execution_construction() -> None:
     r1 = _result(status=ExecutionStatus.EXECUTED, output="done")
     r2 = _result(status=ExecutionStatus.BLOCKED, output="blocked by policy")
 
-    execution = RemediationExecution(
-        step_results=[r1, r2], completed_at=ts
-    )
+    execution = RemediationExecution(step_results=[r1, r2], completed_at=ts)
 
     assert len(execution.step_results) == 2
     assert execution.step_results[0].status is ExecutionStatus.EXECUTED
@@ -199,4 +191,3 @@ def test_invalid_execution_status_is_rejected() -> None:
             status="magic",
             output="nope",
         )
-

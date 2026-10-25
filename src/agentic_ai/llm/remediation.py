@@ -68,9 +68,7 @@ def plan_remediation(
             plan = RemediationPlan.model_validate_json(response.content)
 
             unknown = {
-                s.target_service
-                for s in plan.steps
-                if s.target_service not in AVAILABLE_SERVICES
+                s.target_service for s in plan.steps if s.target_service not in AVAILABLE_SERVICES
             }
             if unknown:
                 raise ValueError(f"Unknown target service(s): {sorted(unknown)}")

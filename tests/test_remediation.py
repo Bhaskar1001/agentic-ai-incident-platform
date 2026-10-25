@@ -44,9 +44,7 @@ def _plan_json(*steps: dict) -> str:
 
 
 def _model_step(action: str) -> RemediationStep:
-    return RemediationStep(
-        action_type=action, target_service="payment", rationale="x"
-    )
+    return RemediationStep(action_type=action, target_service="payment", rationale="x")
 
 
 def test_every_action_type_has_a_risk_tier() -> None:

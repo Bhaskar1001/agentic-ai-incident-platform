@@ -85,9 +85,7 @@ class RemediationPlan(BaseModel):
     @property
     def requires_human_approval(self) -> bool:
         risk = self.highest_risk
-        return risk is not None and _RISK_ORDER.index(risk) >= _RISK_ORDER.index(
-            RiskTier.HIGH
-        )
+        return risk is not None and _RISK_ORDER.index(risk) >= _RISK_ORDER.index(RiskTier.HIGH)
 
 
 class ExecutionStatus(str, Enum):
@@ -118,18 +116,14 @@ class StepExecutionResult(BaseModel, frozen=True):
     output: str
     """Deterministic description of what the executor did or why it did not."""
     error: str | None = None
-    executed_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    executed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class RemediationExecution(BaseModel, frozen=True):
     """The complete record of executing (or declining) a guarded plan."""
 
     step_results: list[StepExecutionResult] = Field(default_factory=list)
-    completed_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    completed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 __all__ = [

@@ -124,9 +124,7 @@ def test_rejection_keeps_a_step_unexecutable() -> None:
 
 
 def test_a_blocked_step_cannot_be_approved() -> None:
-    plan = guard_plan(
-        RemediationPlan(steps=[_step("failover")]), _analysis(0.2), SERVICES
-    )
+    plan = guard_plan(RemediationPlan(steps=[_step("failover")]), _analysis(0.2), SERVICES)
     with pytest.raises(GuardrailError, match="blocked"):
         plan.approve(0, "alice")
 

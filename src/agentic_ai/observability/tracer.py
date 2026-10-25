@@ -482,4 +482,3 @@ __all__ = [
     "StructuredJsonFormatter",
     "ToolSpanHandle",
 ]
-

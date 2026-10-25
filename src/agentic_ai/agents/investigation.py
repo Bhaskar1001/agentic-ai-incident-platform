@@ -49,9 +49,7 @@ retrieved. Sufficiency of evidence is a boundary, so deterministic code owns
 it rather than the model's discretion.
 """
 
-REQUIRED_TOOLS = frozenset(
-    {"get_mock_logs", "get_mock_metrics", "get_mock_pod_status"}
-)
+REQUIRED_TOOLS = frozenset({"get_mock_logs", "get_mock_metrics", "get_mock_pod_status"})
 """The mandatory evidence floor - distinct from INVESTIGATION_TOOLS as a whole.
 
 search_knowledge_base is registered and callable but deliberately excluded
@@ -345,8 +343,7 @@ def budget_exhausted_node(state: InvestigationState) -> dict[str, Any]:
             TimelineEntry(
                 event_type=TimelineEventType.STEP_LIMIT_REACHED,
                 description=(
-                    f"Stopped after {MAX_INVESTIGATION_STEPS} steps without "
-                    "the agent concluding."
+                    f"Stopped after {MAX_INVESTIGATION_STEPS} steps without the agent concluding."
                 ),
             )
         ],
@@ -458,8 +455,9 @@ def _summarise(state: InvestigationState) -> InvestigationResult:
     for owned in ("evidence", "timeline", "termination_reason"):
         schema["properties"].pop(owned, None)
     schema["required"] = [
-        field for field in schema.get("required", []) if field not in
-        ("evidence", "timeline", "termination_reason")
+        field
+        for field in schema.get("required", [])
+        if field not in ("evidence", "timeline", "termination_reason")
     ]
 
     instruction = _SUMMARY_INSTRUCTION

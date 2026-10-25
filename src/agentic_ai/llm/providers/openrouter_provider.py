@@ -46,9 +46,7 @@ class OpenRouterClient:
                 "and fill in a key from https://openrouter.ai/keys."
             )
 
-        self.model = model or os.environ.get(
-            "OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL
-        )
+        self.model = model or os.environ.get("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL)
 
     def complete(
         self,

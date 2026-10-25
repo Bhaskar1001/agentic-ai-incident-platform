@@ -55,11 +55,11 @@ _BEARER_TOKEN_REGEX = re.compile(
 )
 # Note: sk-ant- is ordered before sk- to avoid partial prefix shadowing
 _KEY_PREFIX_REGEXES = (
-    re.compile(r"\b(sk-ant-[A-Za-z0-9_\-]{10,})\b"),       # Anthropic-style
-    re.compile(r"\b(sk-[A-Za-z0-9_\-]{10,})\b"),           # OpenAI-style
-    re.compile(r"\b(AKIA[0-9A-Z]{16})\b"),                 # AWS Access Key ID
-    re.compile(r"\b(ghp_[A-Za-z0-9]{36})\b"),              # GitHub Personal Access Token
-    re.compile(r"\b(xox[baprs]-[A-Za-z0-9_\-]{10,})\b"),   # Slack tokens
+    re.compile(r"\b(sk-ant-[A-Za-z0-9_\-]{10,})\b"),  # Anthropic-style
+    re.compile(r"\b(sk-[A-Za-z0-9_\-]{10,})\b"),  # OpenAI-style
+    re.compile(r"\b(AKIA[0-9A-Z]{16})\b"),  # AWS Access Key ID
+    re.compile(r"\b(ghp_[A-Za-z0-9]{36})\b"),  # GitHub Personal Access Token
+    re.compile(r"\b(xox[baprs]-[A-Za-z0-9_\-]{10,})\b"),  # Slack tokens
 )
 _INLINE_KEY_VALUE_REGEX = re.compile(
     r"(?i)([\?&]?(?:x[_-]?api[_-]?key|password|passwd|pwd|secret|auth[_-]?token|token|api[_-]?key|apikey|credentials?|private[_-]?key|access[_-]?key|client[_-]?secret)\s*[:=]\s*)([\"']?)([^\s,\"\'&]+)([\"']?)",
@@ -87,7 +87,9 @@ def mask_secrets(text: str) -> str:
 
     try:
         # 1. URL basic auth
-        masked = _URL_BASIC_AUTH_REGEX.sub(rf"\1{REDACTED_PLACEHOLDER}:{REDACTED_PLACEHOLDER}@", text)
+        masked = _URL_BASIC_AUTH_REGEX.sub(
+            rf"\1{REDACTED_PLACEHOLDER}:{REDACTED_PLACEHOLDER}@", text
+        )
 
         # 2. Authorization headers (Basic or raw custom token)
         masked = _BASIC_AUTH_HEADER_REGEX.sub(rf"\1{REDACTED_PLACEHOLDER}", masked)

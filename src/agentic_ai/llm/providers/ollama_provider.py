@@ -22,9 +22,7 @@ class OllamaClient:
     """LLMClient backed by a local Ollama server."""
 
     def __init__(self, model: str | None = None) -> None:
-        self.model = model or os.environ.get(
-            "OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL
-        )
+        self.model = model or os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
 
     def complete(
         self,

@@ -165,9 +165,7 @@ class CaseEvaluationResult(BaseModel, frozen=True):
     expected: ExpectedOutcome
     actual: ActualExecution | None = None
     violations: list[str] = Field(default_factory=list)
-    evaluated_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    evaluated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class InvariantViolation(BaseModel, frozen=True):
@@ -236,9 +234,7 @@ class EvaluationReport(BaseModel, frozen=True):
     metrics: EvaluationMetrics
     case_results: list[CaseEvaluationResult]
     violations: list[InvariantViolation] = Field(default_factory=list)
-    generated_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     def to_summary_text(self) -> str:
         """Render a readable console summary table."""
@@ -304,4 +300,3 @@ __all__ = [
     "GateBOutcome",
     "InvariantViolation",
 ]
-

@@ -69,9 +69,7 @@ class RootCauseAnalysis(BaseModel):
     structured output, the same way an invalid enum value is, not quietly
     accepted."""
 
-    alternative_hypotheses: list[AlternativeHypothesis] = Field(
-        default_factory=list
-    )
+    alternative_hypotheses: list[AlternativeHypothesis] = Field(default_factory=list)
 
     knowledge_base_consistency: KnowledgeBaseConsistency
     knowledge_base_note: str = ""

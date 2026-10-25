@@ -137,6 +137,7 @@ def test_structured_json_formatter_exception_traceback_redacted() -> None:
         raise ValueError("Connection failed using Bearer eyJhbGciOi_secret_jwt")
     except ValueError:
         import sys
+
         record = logging.LogRecord(
             name="err_logger",
             level=logging.ERROR,
@@ -196,7 +197,10 @@ def test_structured_json_formatter_outer_fallback_on_catastrophic_error() -> Non
     )
     # Simulate a catastrophic failure during record inspection (e.g. getMessage raising)
     from unittest.mock import Mock
-    record.getMessage = Mock(side_effect=RuntimeError("Fatal logger failure with token=sk-supersecret"))
+
+    record.getMessage = Mock(
+        side_effect=RuntimeError("Fatal logger failure with token=sk-supersecret")
+    )
 
     line = formatter.format(record)
     assert "\n" not in line
@@ -409,7 +413,9 @@ def test_snapshot_deep_isolation_mutating_nested_dict_does_not_corrupt_tracer() 
     with tracer.stage_span("investigate", metadata={"initial_key": "initial_value"}):
         pass
 
-    with tracer.tool_span("get_mock_metrics", target_service="payment", arguments={"service": "payment"}):
+    with tracer.tool_span(
+        "get_mock_metrics", target_service="payment", arguments={"service": "payment"}
+    ):
         pass
 
     # Extract first snapshot
@@ -521,5 +527,3 @@ def test_tracing_failure_never_suppresses_original_stage_exception() -> None:
     with pytest.raises(KeyError, match="Original stage error"):
         with tracer.stage_span("failing_stage"):
             raise KeyError("Original stage error")
-
-
