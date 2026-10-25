@@ -1,0 +1,34 @@
+# Version control
+.git
+.gitignore
+.github
+
+# Virtual environment & package managers
+.venv
+uv.lock.temp*
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment files & secrets (never bake into images)
+.env
+.env.*
+!.env.example
+
+# Local operational artifacts & memory
+.agentic_memory/
+*.log
+
+# Editor & IDE artifacts
+.vscode/
+.idea/
+.claude/
+
+# Documentation & updates log (not needed in runtime container)
+UPDATESLOG.md
+

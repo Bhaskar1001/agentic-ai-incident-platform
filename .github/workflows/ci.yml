@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-lint:
+    name: Test & Code Quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.10"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.10
+
+      - name: Install dependencies from lockfile
+        run: uv sync --frozen --all-groups
+
+      - name: Run Ruff Lint Check
+        run: uv run ruff check .
+
+      - name: Run Ruff Format Check
+        run: uv run ruff format --check src/agentic_ai/config.py src/agentic_ai/api src/agentic_ai/cli.py src/agentic_ai/domain/persistence.py src/agentic_ai/persistence tests/test_config.py tests/test_api.py tests/test_cli.py tests/test_persistence.py tests/test_migrations.py
+
+      - name: Run Automated Test Suite
+        env:
+          LLM_PROVIDER: openrouter
+          LOG_LEVEL: INFO
+        run: uv run pytest -v
+
