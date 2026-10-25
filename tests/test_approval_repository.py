@@ -36,6 +36,7 @@ from tests.approval_helpers import (
     HIGH_ROLLBACK,
     LOW,
     explain,
+    pg_repository,
     seed_realistic_approvals,
     guarded,
     new_incident_id,
@@ -347,7 +348,7 @@ def _insert_approval(conn, incident_id: str, **overrides) -> None:
 
 def _real_incident(conn) -> str:
     incident_id = new_incident_id()
-    PostgresIncidentRepository(lambda: __import__("psycopg").connect(conn.info.dsn)).save_incident(
+    pg_repository().save_incident(
         IncidentRecord.from_workflow_state(state_for(incident_id, guarded(HIGH_ROLLBACK)))
     )
     return incident_id
@@ -414,7 +415,7 @@ def test_the_status_constraint_now_admits_awaiting_approval(pg_connection) -> No
     incident_id = new_incident_id()
     record = IncidentRecord.from_workflow_state(state_for(incident_id, guarded(HIGH_ROLLBACK)))
     assert record.status == IncidentLifecycleStatus.AWAITING_APPROVAL
-    repo = PostgresIncidentRepository(lambda: __import__("psycopg").connect(pg_connection.info.dsn))
+    repo = pg_repository()
     repo.save_incident(record)
     assert repo.get_incident(incident_id).status == IncidentLifecycleStatus.AWAITING_APPROVAL
 

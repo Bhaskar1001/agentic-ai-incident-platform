@@ -291,3 +291,16 @@ def explain(conn, sql: str) -> list[str]:
     """The query plan as lines, with sequential scans discouraged so an index is shown if usable."""
     conn.execute("SET enable_seqscan = off")
     return [row[0] for row in conn.execute("EXPLAIN " + sql).fetchall()]
+
+
+def pg_repository():
+    """A PostgreSQL repository built from the real ``DATABASE_URL``.
+
+    Tests that need a second connection must use this, not ``conn.info.dsn``: psycopg leaves the
+    password out of ``info.dsn`` on purpose, so a connection rebuilt from it fails against any
+    server that requires one (CI's does; a trust-authenticated local server does not).
+    """
+    from agentic_ai.config import Settings
+    from agentic_ai.persistence.postgres import PostgresIncidentRepository
+
+    return PostgresIncidentRepository.from_url(Settings.from_env().get_database_url_value())

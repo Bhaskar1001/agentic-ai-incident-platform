@@ -35,6 +35,7 @@ from tests.approval_helpers import (
     HIGH_ROLLBACK,
     analysis,
     explain,
+    pg_repository,
     seed_realistic_approvals,
     guarded,
     new_incident_id,
@@ -436,9 +437,7 @@ def _snapshot_row(conn, incident_id: str, *, checksum="d" * 64):
 
 
 def _real_incident(conn) -> str:
-    from agentic_ai.persistence.postgres import PostgresIncidentRepository
-
-    store = PostgresIncidentRepository.from_url(conn.info.dsn)
+    store = pg_repository()
     record, _, _ = saved_incident(store, HIGH_ROLLBACK)
     return record.incident_id
 
@@ -562,7 +561,7 @@ def test_the_lock_dies_with_its_session(pg_clean) -> None:
     database session, so killing the session frees it."""
     from agentic_ai.persistence.postgres import PostgresIncidentRepository
 
-    store = PostgresIncidentRepository.from_url(pg_clean.info.dsn)
+    store = pg_repository()
     incident_id = new_incident_id()
 
     with store.resume_lock(incident_id) as held:
