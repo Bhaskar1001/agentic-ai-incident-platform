@@ -14,6 +14,20 @@ jobs:
     name: Test & Code Quality
     runs-on: ubuntu-latest
 
+    # A real PostgreSQL so the DATABASE_URL-gated tests run in CI instead of skipping.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -40,5 +54,6 @@ jobs:
         env:
           LLM_PROVIDER: openrouter
           LOG_LEVEL: INFO
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
         run: uv run pytest -v
 
